@@ -55,7 +55,7 @@ class PowerFunction(torch.autograd.Function):
         N, C, H, W = x.size()
         x2 = (mask_x * mask_x).mean(dim=0)
 
-       	var = x2.reshape(1, C, 1, 1)
+        var = x2.reshape(1, C, 1, 1)
         if current_iter <= warmup_iters:
             z = x /(var + eps).sqrt()
         else:
