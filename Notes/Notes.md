@@ -5,3 +5,6 @@
 ---
 9/8/2024
 - LN - Layer Normalization Impact = https://chatgpt.com/c/3c00722d-09ea-413a-ae5b-2900900f8040
+---
+24/8/2024
+- 
