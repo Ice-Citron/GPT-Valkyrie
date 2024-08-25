@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from torch.nn.modules._functions import SyncBatchNorm as sync_batch_norm
+from torch.nn.modules. import SyncBatchNorm as sync_batch_norm
 
 __all__ = ['MaskSyncBatchNorm']
 
@@ -25,7 +25,7 @@ class LayerScaling1D(nn.Module):
     Examples::
         >>> ls = LayerScaling()
         >>> input = torch.randn(20, 100)
-        >>> output = ls(input)
+        >>> output = ls(input)_functions
     """
     def __init__(self, eps=1e-5, **kwargs):
         super(LayerScaling1D, self).__init__()
