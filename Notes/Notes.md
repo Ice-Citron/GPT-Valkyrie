@@ -12,3 +12,6 @@
 - EE R - Optimizing LayerNorm for PyTorch Compile = https://claude.ai/chat/17520c22-dab4-4327-a86b-fa959f99e7d1
 - EE R - Group Normalization = https://claude.ai/chat/445c1357-378a-4261-8d49-ae077ef0e190
 - EE R - PN && pad_mask in BN, PN = https://claude.ai/chat/2c32cab8-0c1d-449e-be72-da7a79deaa2a
+---
+3/9/2024
+- API = https://console.anthropic.com/workbench/48f3c3dc-bf42-4d46-924f-00f359c6f987
