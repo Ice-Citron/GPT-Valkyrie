@@ -428,7 +428,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, train_loader, val_loader)
     optimizer.load_state_dict(checkpoint['optimizer'])
     train_loader.set_state(checkpoint['train_loader_state'])
     val_loader.set_state(checkpoint['val_loader_state'])
-    return checkpoint['step'], checkpoint['val_loss'], checkpoint['run_name']
+    return checkpoint['step'], checkpoint['val_loss'], checkpoint['run_name'], checkpoint['wandb_id']
 
 
 
@@ -493,27 +493,41 @@ else:
 
 # -----------------------------------------------------------------------------
 
-project_name = "shng2025/GPT-Valkyrie_LN-124m"
-
 # GPTesla - 111M param setup in comment. Modification to make lighter training requirement needed
 config = {
-    "batch_size": 64,
     "weight_decay": 0.1,
-    # "shuffle_buffer": 1000,
-    "learning_rate": 6e-4,
-    "lr_scheduler_type": "cosine",
-    "num_warmup_steps": 715,  # 2000
+    # "lr_scheduler_type": "cosine",
     "gradient_accumulation_steps": 2**19 // (64 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
-    "max_train_steps": 19073,  # 150000
     "max_eval_steps": 20,
     "seq_length": 1024,
-    "seed": 1,
-    "resume_from_checkpoint": True,
-    # "save_checkpoint_steps": 10000,
+
+    # New centralised parameters
+    "project_name": "shng2025/GPT-Valkyrie_LN-124m",
+    "total_batch_size": 524288,  # 2**19, ~0.5M, in number of tokens
+    "micro_batch_size": 64,
+    "max_lr": 6e-4,
+    "min_lr": 6e-5,  # 10% of max_lr // not used, as we are using weight_decay instead
+    "warmup_steps": 715,
+    "max_steps": 19073,
+    "val_every": 250,           # EVALUATION
+    "generate_every": 250,      # EVALUATION
+    "hellaswag_every": 250,     # EVALUATION
+    "save_every": 80,           # SAVE CHECKPOINTING   
+    "log_dir": "./log",
+    "device": "auto",  # "auto", "cpu", "cuda", or "mps"
+    "use_compile": True,
+    "grad_clip": 1.0,
+    "num_return_sequences": 4,
+    "max_generate_length": 32,
+    "top_k": 50,
+
+    "resume_from_checkpoint": False,
 }
 
 args = Namespace(**config)
-samples_per_step = torch.cuda.device_count() * args.batch_size
+samples_per_step = torch.cuda.device_count() * args.micro_batch_size
+
+project_name = args.project_name
 
 # Logging - DEPRECATED
 if master_process:
@@ -534,9 +548,9 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
+total_batch_size = args.total_batch_size # 2**19, ~0.5M, in number of tokens
+B = args.micro_batch_size # micro batch size
+T = args.seq_length # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -559,10 +573,10 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_lr = args.max_lr
+min_lr = max_lr * args.weight_decay
+warmup_steps = args.warmup_steps
+max_steps = args.max_steps # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -577,10 +591,10 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay, learning_rate=args.max_lr, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "./log"
+log_dir = args.log_dir
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
@@ -598,18 +612,15 @@ if master_process:
 starting_step = 0
 
 if args.resume_from_checkpoint:
-    checkpoint_dir = "./log"
+    checkpoint_dir = args.log_dir
     checkpoint_pattern = os.path.join(checkpoint_dir, "checkpoint_*.pt")
     checkpoint_files = glob.glob(checkpoint_pattern)
     latest_checkpoint = max(checkpoint_files, key=os.path.getctime)
     checkpoint_path = latest_checkpoint
 
     # Use the load_checkpoint function here
-    starting_step, val_loss, run_name = load_checkpoint(checkpoint_path, raw_model, optimizer, train_loader, val_loader)
+    starting_step, val_loss, run_name, wandb_id = load_checkpoint(checkpoint_path, raw_model, optimizer, train_loader, val_loader)
     starting_step += 1 # to make sure step 80 isn't repeated
-
-    checkpoint = torch.load(checkpoint_path)
-    wandb_id = checkpoint['wandb_id']
 
     logger, run_name = resume_logging(project_name.split("/")[1], wandb_id, args)
     print(f"Resuming from checkpoint: {checkpoint_path}")
@@ -645,12 +656,12 @@ for step in range(starting_step, max_steps):
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
+    if step % args.val_every == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_loss_steps = 20
+            val_loss_steps = args.max_eval_steps
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
@@ -660,27 +671,9 @@ for step in range(starting_step, max_steps):
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            log_metrics({"loss/validation": val_loss_accum})
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                print("NEEDS TO BE DEPRECATED WHEN SEEN IN FUTYRE, OLD CODE")
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    if (step % args.hellaswag_every == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -714,10 +707,10 @@ for step in range(starting_step, max_steps):
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+    if ((step > 0 and step % args.generate_every == 0) or last_step) and (not use_compile):
         model.eval()
-        num_return_sequences = 4
-        max_length = 32
+        num_return_sequences = args.num_return_sequences
+        max_length = args.max_generate_length
         tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -735,7 +728,7 @@ for step in range(starting_step, max_steps):
                 probs = F.softmax(logits, dim=-1)
                 # do top-k sampling of 50 (huggingface pipeline default)
                 # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, args.top_k, dim=-1) # top_k == 50 in this case
                 # select a token from the top-k probabilities
                 # note: multinomial does not demand the input to sum to 1
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
@@ -749,7 +742,7 @@ for step in range(starting_step, max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
-    if step % 80 == 0 or last_step:
+    if step % args.save_every == 0 or last_step:
         # Evaluate
         model.eval()
         val_loss_accum = 0.0
@@ -800,7 +793,7 @@ for step in range(starting_step, max_steps):
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip) # grad_clip == 1.0 by default
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
