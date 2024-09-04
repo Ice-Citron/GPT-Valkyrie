@@ -298,7 +298,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "edu_fineweb10B"
+        data_root = "./../edu_fineweb10B" # decided to make some changes, raw datafiles will always be outside of repo branch instead
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s] # listing out shards file in the data_root dir
         shards = sorted(shards)
@@ -633,6 +633,13 @@ if args.resume_from_checkpoint:
         # create_branch(project_name, repo_type="model", branch=new_branch_name)
         hf_repo = Repository("./", clone_from=project_name, revision=run_name)
 
+    # Local subprocess for git pulling and checking out the newest branch
+    if master_process:
+        import subprocess
+        subprocess.run(["git", "fetch", "origin"])
+        subprocess.run(["git", "checkout", new_branch_name])
+        subprocess.run(["git", "pull", "origin", new_branch_name])
+
     if master_process:
         print(f"Resuming from checkpoint at step {starting_step}")
 else:
@@ -793,7 +800,7 @@ for step in range(starting_step, max_steps):
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip) # grad_clip == 1.0 by default
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # grad_clip == 1.0 by default
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
