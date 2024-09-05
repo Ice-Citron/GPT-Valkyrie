@@ -151,7 +151,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 100277 # for cl100k_base  ///  # 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
@@ -210,6 +210,7 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type):
+        raise "No longer supported"
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
@@ -546,7 +547,7 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-enc = tiktoken.get_encoding("gpt2")
+enc = tiktoken.get_encoding("cl100k_base")
 
 total_batch_size = args.total_batch_size # 2**19, ~0.5M, in number of tokens
 B = args.micro_batch_size # micro batch size
@@ -563,7 +564,7 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(GPTConfig(vocab_size=100277))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
