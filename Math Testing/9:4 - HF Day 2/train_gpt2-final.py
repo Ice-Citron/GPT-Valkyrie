@@ -151,7 +151,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
-    vocab_size: int = 100277 # for cl100k_base  ///  # 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
@@ -210,7 +210,6 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type):
-        raise "No longer supported"
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
@@ -299,7 +298,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "./../edu_fineweb10B" # decided to make some changes, raw datafiles will always be outside of repo branch instead
+        data_root = "./../edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s] # listing out shards file in the data_root dir
         shards = sorted(shards)
@@ -504,16 +503,16 @@ config = {
 
     # New centralised parameters
     "project_name": "shng2025/GPT-Valkyrie_LN-124m",
-    "total_batch_size": 524288,  # 2**19, ~0.5M, in number of tokens
+    "total_batch_size": 2**19, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
     "micro_batch_size": 64,
     "max_lr": 6e-4,
     "min_lr": 6e-5,  # 10% of max_lr // not used, as we are using weight_decay instead
     "warmup_steps": 715,
     "max_steps": 19073,
-    "val_every": 250,           # EVALUATION
-    "generate_every": 250,      # EVALUATION
-    "hellaswag_every": 250,     # EVALUATION
-    "save_every": 80,           # SAVE CHECKPOINTING   
+    "val_every": 500,           # EVALUATION
+    "generate_every": 500,      # EVALUATION
+    "hellaswag_every": 500,     # EVALUATION
+    "save_every": 2000,           # SAVE CHECKPOINTING   
     "log_dir": "./log",
     "device": "auto",  # "auto", "cpu", "cuda", or "mps"
     "use_compile": True,
@@ -547,7 +546,7 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-enc = tiktoken.get_encoding("cl100k_base")
+enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = args.total_batch_size # 2**19, ~0.5M, in number of tokens
 B = args.micro_batch_size # micro batch size
@@ -561,10 +560,10 @@ if master_process:
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('highest')
 
 # create model
-model = GPT(GPTConfig(vocab_size=100277))
+model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
