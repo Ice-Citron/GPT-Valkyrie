@@ -521,7 +521,7 @@ config = {
     "max_generate_length": 32,
     "top_k": 50,
 
-    "resume_from_checkpoint": False,
+    "resume_from_checkpoint": True,
 }
 
 args = Namespace(**config)
@@ -560,7 +560,7 @@ if master_process:
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
-torch.set_float32_matmul_precision('highest')
+torch.set_float32_matmul_precision('medium')
 
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
@@ -750,25 +750,6 @@ for step in range(starting_step, max_steps):
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     if step % args.save_every == 0 or last_step:
-        # Evaluate
-        model.eval()
-        val_loss_accum = 0.0
-        val_steps = 0
-        for _ in range(args.max_eval_steps):
-            x, y = val_loader.next_batch()
-            x, y = x.to(device), y.to(device)
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    _, loss = model(x, y)
-            val_loss_accum += loss
-            val_steps += 1
-        val_loss_accum /= val_steps
-
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-
-        model.train()
-
         if master_process:
             # Save checkpoint and push to HuggingFace
             checkpoint_path = save_checkpoint(
