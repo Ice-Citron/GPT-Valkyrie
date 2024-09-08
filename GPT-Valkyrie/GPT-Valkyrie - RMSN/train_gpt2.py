@@ -19,6 +19,10 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
+from huggingface_hub import Repository, create_branch
+import logging
+import glob
+
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -77,50 +81,37 @@ import numbers
 
 _shape_t = Union[int, List[int], Size]
 
-class LayerNorm(nn.Module):
-
+class RMSNorm(nn.Module):
     __constants__ = ['normalized_shape', 'eps', 'elementwise_affine']
     normalized_shape: Tuple[int, ...]
     eps: float
     elementwise_affine: bool
 
-    def __init__(self, normalized_shape: _shape_t, eps: float = 1e-5, elementwise_affine: bool = True, bias: bool = True, device=None, dtype=None) -> None:
+    def __init__(self, normalized_shape: Union[int, Tuple[int, ...]], eps: float = 1e-5, elementwise_affine: bool = True, device=None, dtype=None) -> None:
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         if isinstance(normalized_shape, numbers.Integral):
-            # mypy error: incompatible types in assignment
-            normalized_shape = (normalized_shape,)  # type: ignore[assignment]
-        self.normalized_shape = tuple(normalized_shape)  # type: ignore[arg-type]
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         if self.elementwise_affine:
-            self.gain = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
-            if bias:
-                self.bias = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
-            else:
-                self.register_parameter('bias', None)
+            self.gain = nn.Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
         else:
             self.register_parameter('gain', None)
-            self.register_parameter('bias', None)
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         if self.elementwise_affine:
-            init.ones_(self.gain)
-            if self.bias is not None:
-                init.zeros_(self.bias)
+            nn.init.ones_(self.gain)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass of LayerNorm."""
-        mean = x.mean(dim=-1, keepdim=True)
-        var = torch.var(x, dim=-1, keepdim=True, unbiased=False) # mean_x2 = torch.square(x).mean(dim=-1, keepdim=True) // alternate code for varience calculation, faster torch.compile
-                                                                 # var = mean_x2 - torch.square(mean)
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
-
+        """Forward pass of RMSNorm."""
+        mean_square = torch.mean(torch.square(x), dim=-1, keepdim=True)
+        x_norm = x * torch.rsqrt(mean_square + self.eps)
         if self.elementwise_affine:
-            x_norm = self.gain * x_norm + self.bias # changed name of weight parameter, to gain parameter to concur with naming convention
-
+            x_norm = self.gain * x_norm
         return x_norm
         
     def extra_repr(self) -> str:
@@ -133,9 +124,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -163,7 +154,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -196,7 +187,7 @@ class GPT(nn.Module):
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
-        # forward the final layernorm and the classifier
+        # forward the final RMSNorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
@@ -258,7 +249,7 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and RMSNorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
@@ -294,7 +285,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "edu_fineweb10B"
+        data_root = "./../edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s] # listing out shards file in the data_root dir
         shards = sorted(shards)
@@ -303,6 +294,11 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+
+        # NEW IMPL
+        self.current_shard = 0
+        self.current_position = self.B * self.T * self.process_rank
+
         self.reset()
 
     def reset(self):
@@ -310,6 +306,17 @@ class DataLoaderLite:
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
+
+    def set_state(self, state):
+        self.current_shard = state['current_shard']
+        self.current_position = state['current_position']
+        self.tokens = load_tokens(self.shards[self.current_shard])
+
+    def get_state(self):
+        return {
+            'current_shard': self.current_shard,
+            'current_position': self.current_position
+        }
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -326,20 +333,90 @@ class DataLoaderLite:
         return x, y
 
 
-def setup_logging(project_name):
+def setup_logging(project_name, args):
+    logger = logging.getLogger(__name__)
+    dir_name = "./log"
+    os.makedirs(dir_name, exist_ok=True)
+    print(f"Directory '{dir_name}' {'already exists' if os.path.exists(dir_name) else 'was created'}.")
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(f"log/debug_{ddp_rank}.log"),
+            logging.StreamHandler(),
+        ],
+    )
+
     if master_process:
         wandb.init(project=project_name, config=args, dir="./../")
         run_name = wandb.run.name
         wandb_id = wandb.run.id
+        logger.setLevel(logging.INFO)
+        print(f"Starting new run: {run_name}")
     else:
         run_name = ""
-        wandb_id = 0 
+        wandb_id = ""
+        logger.setLevel(logging.ERROR)
 
-    return run_name, wandb_id
+    return logger, run_name, wandb_id
+
+def resume_logging(project_name, run_id, args):
+    logger = logging.getLogger(__name__)
+    dir_name = "./log"
+    os.makedirs(dir_name, exist_ok=True)
+    print(f"Directory '{dir_name}' {'already exists' if os.path.exists(dir_name) else 'was created'}.")
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(f"log/debug_{ddp_rank}.log"),
+            logging.StreamHandler(),
+        ],
+    )
+
+    if master_process:
+        wandb.init(project=project_name, id=run_id, resume="must", config=args, dir='./../')
+        run_name = wandb.run.name
+        logger.setLevel(logging.INFO)
+        print(f"Resuming run: {run_name}")
+    else:
+        run_name = ""
+        logger.setLevel(logging.ERROR)
+
+    return logger, run_name
+
 
 def log_metrics(metrics):
     if master_process:
         wandb.log(metrics)
+
+def save_checkpoint(model, optimizer, step, val_loss, run_name, train_loader_state, val_loader_state, wandb_id):
+    checkpoint = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'step': step,
+        'val_loss': val_loss,
+        'run_name': run_name,
+        'train_loader_state': train_loader_state,
+        'val_loader_state': val_loader_state,
+        'wandb_id': wandb_id
+    }
+    checkpoint_path = os.path.join(log_dir, f"checkpoint_{step}.pt")
+    torch.save(checkpoint, checkpoint_path)
+    return checkpoint_path
+
+def load_checkpoint(checkpoint_path, model, optimizer, train_loader, val_loader):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    train_loader.set_state(checkpoint['train_loader_state'])
+    val_loader.set_state(checkpoint['val_loader_state'])
+    return checkpoint['step'], checkpoint['val_loss'], checkpoint['run_name'], checkpoint['wandb_id']
+
 
 
 # -----------------------------------------------------------------------------
@@ -403,32 +480,48 @@ else:
 
 # -----------------------------------------------------------------------------
 
-project_name = "shng2025/nanoGPT-Valkyrie"
-
 # GPTesla - 111M param setup in comment. Modification to make lighter training requirement needed
 config = {
-    "batch_size": 64,
     "weight_decay": 0.1,
-    # "shuffle_buffer": 1000,
-    "learning_rate": 6e-4,
-    "lr_scheduler_type": "cosine",
-    "num_warmup_steps": 715,  # 2000
+    # "lr_scheduler_type": "cosine",
     "gradient_accumulation_steps": 2**19 // (64 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
-    "max_train_steps": 19073,  # 150000
     "max_eval_steps": 20,
     "seq_length": 1024,
-    "seed": 1,
-    # "save_checkpoint_steps": 10000,
+
+    # New centralised parameters
+    "project_name": "shng2025/GPT-Valkyrie_LN-124m",
+    "total_batch_size": 2**19, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
+    "micro_batch_size": 64,
+    "max_lr": 6e-4,
+    "min_lr": 6e-5,  # 10% of max_lr // not used, as we are using weight_decay instead
+    "warmup_steps": 715,
+    "max_steps": 19073,
+    "val_every": 500,           # EVALUATION
+    "generate_every": 500,      # EVALUATION
+    "hellaswag_every": 500,     # EVALUATION
+    "save_every": 2000,           # SAVE CHECKPOINTING   
+    "log_dir": "./log",
+    "device": "auto",  # "auto", "cpu", "cuda", or "mps"
+    "use_compile": True,
+    "grad_clip": 1.0,
+    "num_return_sequences": 4,
+    "max_generate_length": 32,
+    "top_k": 50,
+
+    "resume_from_checkpoint": False,
 }
 
 args = Namespace(**config)
-samples_per_step = torch.cuda.device_count() * args.batch_size
+samples_per_step = torch.cuda.device_count() * args.micro_batch_size
 
-# Logging
+project_name = args.project_name
+
+# Logging - DEPRECATED
 if master_process:
-    run_name, wandb_id = setup_logging(project_name.split("/")[1])
-    print(f"Weights and Biases run name: {run_name}")
-    print(f"Weights and Biases run id  : {wandb_id}")
+    pass
+    # run_name, wandb_id = setup_logging(project_name.split("/")[1])
+    # print(f"Weights and Biases run name: {run_name}")
+    # print(f"Weights and Biases run id  : {wandb_id}")
 
 # -----------------------------------------------------------------------------
 
@@ -442,9 +535,9 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
+total_batch_size = args.total_batch_size # 2**19, ~0.5M, in number of tokens
+B = args.micro_batch_size # micro batch size
+T = args.seq_length # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -454,7 +547,7 @@ if master_process:
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('medium')
 
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
@@ -467,10 +560,10 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_lr = args.max_lr
+min_lr = max_lr * args.weight_decay
+warmup_steps = args.warmup_steps
+max_steps = args.max_steps # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -485,26 +578,84 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay, learning_rate=args.max_lr, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
-log_dir = "log"
+log_dir = args.log_dir
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
-for step in range(max_steps):
+"""
+# Initialize HuggingFace repository
+if master_process:
+    new_branch_name = run_name
+    create_branch(project_name, repo_type="model", branch=new_branch_name)
+    hf_repo = Repository("./", clone_from=project_name, revision=run_name)
+"""
+
+# Training loop
+starting_step = 0
+
+if args.resume_from_checkpoint:
+    checkpoint_dir = args.log_dir
+    checkpoint_pattern = os.path.join(checkpoint_dir, "checkpoint_*.pt")
+    checkpoint_files = glob.glob(checkpoint_pattern)
+    latest_checkpoint = max(checkpoint_files, key=os.path.getctime)
+    checkpoint_path = latest_checkpoint
+
+    # Use the load_checkpoint function here
+    starting_step, val_loss, run_name, wandb_id = load_checkpoint(checkpoint_path, raw_model, optimizer, train_loader, val_loader)
+    starting_step += 1 # to make sure step 80 isn't repeated
+
+    logger, run_name = resume_logging(project_name.split("/")[1], wandb_id, args)
+    print(f"Resuming from checkpoint: {checkpoint_path}")
+    print(f"Weights and Biases run name: {run_name}")
+    print(f"Resuming from step: {starting_step}")
+
+    # Initialize HuggingFace repository <-- UNSURE IF NEEDED
+    if master_process:
+        new_branch_name = run_name
+        # create_branch(project_name, repo_type="model", branch=new_branch_name)
+        hf_repo = Repository("./", clone_from=project_name, revision=run_name)
+
+    # Local subprocess for git pulling and checking out the newest branch
+    if master_process:
+        import subprocess
+        subprocess.run(["git", "fetch", "origin"])
+        subprocess.run(["git", "checkout", new_branch_name])
+        subprocess.run(["git", "pull", "origin", new_branch_name])
+
+    if master_process:
+        print(f"Resuming from checkpoint at step {starting_step}")
+else:
+    starting_step = 0
+    logger, run_name, wandb_id = setup_logging(project_name.split("/")[1], args)
+    print(f"Weights and Biases run name: {run_name}")
+    print(f"Weights and Biases run id  : {wandb_id}")
+
+    # Initialize HuggingFace repository
+    if master_process:
+        new_branch_name = run_name
+        create_branch(project_name, repo_type="model", branch=new_branch_name)
+        hf_repo = Repository("./", clone_from=project_name, revision=run_name)
+    
+    if master_process:
+        print(f"Starting new run: {run_name}")
+
+# Training Loop
+for step in range(starting_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
+    if step % args.val_every == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_loss_steps = 20
+            val_loss_steps = args.max_eval_steps
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
@@ -514,26 +665,9 @@ for step in range(max_steps):
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            log_metrics({"loss/validation": val_loss_accum})
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    if (step % args.hellaswag_every == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -567,10 +701,10 @@ for step in range(max_steps):
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+    if ((step > 0 and step % args.generate_every == 0) or last_step) and (not use_compile):
         model.eval()
-        num_return_sequences = 4
-        max_length = 32
+        num_return_sequences = args.num_return_sequences
+        max_length = args.max_generate_length
         tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -588,7 +722,7 @@ for step in range(max_steps):
                 probs = F.softmax(logits, dim=-1)
                 # do top-k sampling of 50 (huggingface pipeline default)
                 # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                topk_probs, topk_indices = torch.topk(probs, args.top_k, dim=-1) # top_k == 50 in this case
                 # select a token from the top-k probabilities
                 # note: multinomial does not demand the input to sum to 1
                 ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
@@ -601,6 +735,17 @@ for step in range(max_steps):
             tokens = xgen[i, :max_length].tolist()
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+    if step % args.save_every == 0 or last_step:
+        if master_process:
+            # Save checkpoint and push to HuggingFace
+            checkpoint_path = save_checkpoint(
+                raw_model, optimizer, step, val_loss_accum.item(), run_name,
+                train_loader.get_state(), val_loader.get_state(), wandb_id
+            )
+            hf_repo.push_to_hub(commit_message=f"Checkpoint at step {step}")
+            print(f"Saved checkpoint and pushed to HuggingFace at step {step}")
+            log_metrics({"loss/validation": val_loss_accum.item()})
 
     # do one step of the optimization
     model.train()
@@ -623,7 +768,7 @@ for step in range(max_steps):
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # grad_clip == 1.0 by default
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -652,3 +797,9 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
+
+# Final save and push
+if master_process:
+    final_checkpoint_path = checkpoint_path = save_checkpoint(raw_model, optimizer, step, val_loss_accum.item(), run_name, train_loader.get_state(), val_loader.get_state(), wandb_id)
+    hf_repo.push_to_hub(commit_message="Final model")
+    print("Training completed. Final model pushed to HuggingFace.")
