@@ -489,7 +489,7 @@ config = {
     "seq_length": 1024,
 
     # New centralised parameters
-    "project_name": "shng2025/GPT-Valkyrie_LN-124m",
+    "project_name": "shng2025/GPT-Valkyrie_RMSN-124m",
     "total_batch_size": 2**19, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
     "micro_batch_size": 64,
     "max_lr": 6e-4,
