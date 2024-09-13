@@ -570,7 +570,7 @@ config = {
     "val_every": 500,           # EVALUATION
     "generate_every": 500,      # EVALUATION
     "hellaswag_every": 500,     # EVALUATION
-    "save_every": 80,           # SAVE CHECKPOINTING   
+    "save_every": 2000,           # SAVE CHECKPOINTING   
     "log_dir": "./log",
     "device": "auto",  # "auto", "cpu", "cuda", or "mps"
     "use_compile": True,
