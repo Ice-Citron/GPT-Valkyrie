@@ -75,10 +75,8 @@ class MLP(nn.Module):
 
 class SyncPowerFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias, running_phi, eps, afwd, abkw, ema_gz,
-                debug, warmup_iters, current_iter, process_group, world_size):
+    def forward(ctx, x, weight, bias, running_phi, eps, afwd, abkw, ema_gz, warmup_iters, current_iter, process_group, world_size):
         ctx.eps = eps
-        ctx.debug = debug
         current_iter = current_iter.item()
         ctx.current_iter = current_iter
         ctx.warmup_iters = warmup_iters
@@ -95,12 +93,11 @@ class SyncPowerFunction(torch.autograd.Function):
         #    dist.all_reduce(var, op=dist.ReduceOp.AVG, group=process_group)
 
         if current_iter <= warmup_iters:
-            z = x * torch.rsqrt(var + eps) # Shape: (B, T, C)
+            y = x * torch.rsqrt(var + eps) # Shape: (B, T, C)
         else:
-            z = x * torch.rsqrt(running_phi + eps) # Shape: (B, T, C)
+            y = x * torch.rsqrt(running_phi + eps) # Shape: (B, T, C)
 
-        y = z
-        ctx.save_for_backward(z, var, weight, ema_gz)
+        ctx.save_for_backward(y, var, weight, ema_gz)
 
         if current_iter < warmup_iters:
             running_phi.copy_(running_phi * (current_iter-1)/current_iter + var/current_iter)
@@ -117,25 +114,22 @@ class SyncPowerFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         eps = ctx.eps
-        debug = ctx.debug
-        current_iter = ctx.current_iter
-        warmup_iters = ctx.warmup_iters
         abkw = ctx.abkw
 
         B, T, C = grad_output.size()
-        z, var, weight, ema_gz = ctx.saved_tensors
+        y, var, weight, ema_gz = ctx.saved_tensors
 
         g = grad_output * weight.view(1, 1, C)  # Shape: (B, T, C)
-        gz = torch.mean(g * z, dim=(0, 1))  # Shape: (C,)                   // equivalent to "gz = (g * z).mean(dim=1).mean(dim=0)"
+        # gz = torch.mean(g * z, dim=(0, 1))  # Shape: (C,)                   // equivalent to "gz = (g * z).mean(dim=1).mean(dim=0)"
 
-        approx_grad_g = (g - (1 - abkw) * ema_gz * z)
-        ema_gz.add_(torch.mean(approx_grad_g * z, dim=(0, 1), keepdim=True)) # ema_gz MEANS exponential moving average of gz
+        approx_grad_g = (g - (1 - abkw) * ema_gz * y)
+        ema_gz.add_(torch.mean(approx_grad_g * y, dim=(0, 1), keepdim=True)) # ema_gz MEANS exponential moving average of gz
 
         if ctx.process_group is not None:
             dist.all_reduce(ema_gz, op=dist.ReduceOp.AVG, group=ctx.process_group)
 
         gx = torch.rsqrt(var + eps) * approx_grad_g             # Shape: (B, T, C)
-        grad_weight = torch.sum(grad_output * z, dim=(0, 1))    # Shape: (C,)
+        grad_weight = torch.sum(grad_output * y, dim=(0, 1))    # Shape: (C,)
         grad_bias = torch.sum(grad_output, dim=(0, 1))          # Shape: (C,)
 
         if ctx.process_group is not None:
@@ -151,7 +145,7 @@ class SyncPowerNorm(nn.Module):
 
         self.num_features = num_features
         self.eps = eps
-        self.affine = affine
+        # self.affine = affine
         self.process_group = process_group
         self.world_size = dist.get_world_size(process_group) if process_group else 1
 
@@ -167,7 +161,6 @@ class SyncPowerNorm(nn.Module):
 
         self.afwd = alpha_fwd
         self.abkw = alpha_bkw
-        self.debug = False
         self.warmup_iters = warmup_iters
 
     def extra_repr(self):
@@ -181,11 +174,11 @@ class SyncPowerNorm(nn.Module):
         if self.training:
             self.iters.add_(1)
             output = SyncPowerFunction.apply(input, self.weight, self.bias, self.running_phi, self.eps,
-                        self.afwd, self.abkw, self.ema_gz, self.debug, self.warmup_iters, self.iters,
+                        self.afwd, self.abkw, self.ema_gz, self.warmup_iters, self.iters,
                         self.process_group, self.world_size)
         else:
-            var = self.running_phi
-            output = input * torch.rsqrt(var + self.eps)
+            # var = self.running_phi
+            output = input * torch.rsqrt(self.running_phi + self.eps)
             output = self.weight.view(1, 1, C) * output + self.bias.view(1, 1, C)
 
         return output # Shape: (B, T, C)
@@ -557,14 +550,14 @@ else:
 config = {
     "weight_decay": 0.1,
     # "lr_scheduler_type": "cosine",
-    "gradient_accumulation_steps": 2**19 // (8 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
+    "gradient_accumulation_steps": 2**19 // (4 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
     "max_eval_steps": 20,
     "seq_length": 1024,
 
     # New centralised parameters
     "project_name": "shng2025/GPT-Valkyrie_PN-124m",
     "total_batch_size": 2**19, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
-    "micro_batch_size": 8,
+    "micro_batch_size": 4,
     "max_lr": 6e-4,
     "min_lr": 6e-5,  # 10% of max_lr // not used, as we are using weight_decay instead
     "warmup_steps": 715,
