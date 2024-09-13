@@ -86,18 +86,18 @@ class SyncPowerFunction(torch.autograd.Function):
         ctx.process_group = process_group
         ctx.world_size = world_size
 
-        B, T, C = x.size()
+        B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
         x2 = torch.mean(torch.square(x), dim=(0, 1)) # REFER TO why 0 is needed instead:  https://claude.ai/chat/e295478e-0d72-4e79-a4f2-47048d964170 // looks like we have settled to simply manipulating batch instead
 
-        var = x2.reshape(1, 1, C)
+        var = x2.view(1, 1, C)  # Shape: (1, 1, C) /// # CHANGE: Use view instead of reshape to avoid potential copies // var = x2.reshape(1, 1, C)
 
-        if process_group is not None:
-            dist.all_reduce(var, op=dist.ReduceOp.AVG, group=process_group)
+        # if process_group is not None:                                             # cancelled SYNC here. As we should only sync the running statistics (running_phi) alone at the end of forward pass.
+        #    dist.all_reduce(var, op=dist.ReduceOp.AVG, group=process_group)
 
         if current_iter <= warmup_iters:
-            z = torch.rsqrt(var + eps) * x
+            z = x * torch.rsqrt(var + eps) # Shape: (B, T, C)
         else:
-            z = torch.rsqrt(running_phi + eps) * x
+            z = x * torch.rsqrt(running_phi + eps) # Shape: (B, T, C)
 
         y = z
         ctx.save_for_backward(z, var, weight, ema_gz)
@@ -109,9 +109,10 @@ class SyncPowerFunction(torch.autograd.Function):
         if process_group is not None:
             torch.distributed.all_reduce(running_phi, op=torch.distributed.ReduceOp.AVG, group=process_group)
 
-        y = weight.reshape(1, 1, C) * y + bias.reshape(1, 1, C)
+        # CHANGE: Use view for weight and bias, maintain B, T, C shape // https://claude.ai/chat/0f44cae4-e15c-4c3d-acd1-7fef7701356b
+        y = weight.view(1, 1, C) * y + bias.view(1, 1, C) # Shape: (B, T, C)
 
-        return y
+        return y # Shape: (B, T, C)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -124,26 +125,22 @@ class SyncPowerFunction(torch.autograd.Function):
         B, T, C = grad_output.size()
         z, var, weight, ema_gz = ctx.saved_tensors
 
-        y = z
-        g = grad_output * weight.reshape(1, 1, C)
-
-        gz = torch.mean(g * z, dim=(0, 1))
+        g = grad_output * weight.view(1, 1, C)  # Shape: (B, T, C)
+        gz = torch.mean(g * z, dim=(0, 1))  # Shape: (C,)                   // equivalent to "gz = (g * z).mean(dim=1).mean(dim=0)"
 
         approx_grad_g = (g - (1 - abkw) * ema_gz * z)
-        ema_gz.add_(torch.mean(approx_grad_g * z, dim=(0, 1), keepdim=True))
+        ema_gz.add_(torch.mean(approx_grad_g * z, dim=(0, 1), keepdim=True)) # ema_gz MEANS exponential moving average of gz
 
         if ctx.process_group is not None:
             dist.all_reduce(ema_gz, op=dist.ReduceOp.AVG, group=ctx.process_group)
 
-        gx = torch.rsqrt(var + eps) * approx_grad_g 
-        grad_weight = torch.sum(grad_output * y, dim=(0, 1))
-        grad_bias = torch.sum(grad_output, dim=(0, 1))
+        gx = torch.rsqrt(var + eps) * approx_grad_g             # Shape: (B, T, C)
+        grad_weight = torch.sum(grad_output * z, dim=(0, 1))    # Shape: (C,)
+        grad_bias = torch.sum(grad_output, dim=(0, 1))          # Shape: (C,)
 
         if ctx.process_group is not None:
-            process_group = ctx.process_group
-            world_size = ctx.world_size
-            dist.all_reduce(grad_weight, op=dist.ReduceOp.AVG, group=process_group)
-            dist.all_reduce(grad_bias, op=dist.ReduceOp.AVG, group=process_group)
+            dist.all_reduce(grad_weight, op=dist.ReduceOp.AVG, group=ctx.process_group)
+            dist.all_reduce(grad_bias, op=dist.ReduceOp.AVG, group=ctx.process_group)
 
         return gx, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None, None
 
@@ -164,14 +161,12 @@ class SyncPowerNorm(nn.Module):
         self.register_buffer('ema_gz', torch.zeros(1, 1, num_features))
         self.register_buffer('iters', torch.zeros(1).type(torch.LongTensor))
 
-        if process_group is not None:
-            dist.all_reduce(self.running_phi, op=dist.ReduceOp.AVG, group=self.process_group)
-            dist.all_reduce(self.ema_gz, op=dist.ReduceOp.AVG, group=self.process_group)
+        # if process_group is not None:             // REDUNDANT
+        #    dist.all_reduce(self.running_phi, op=dist.ReduceOp.AVG, group=self.process_group)
+        #    dist.all_reduce(self.ema_gz, op=dist.ReduceOp.AVG, group=self.process_group)
 
         self.afwd = alpha_fwd
         self.abkw = alpha_bkw
-
-        self.eps = eps
         self.debug = False
         self.warmup_iters = warmup_iters
 
@@ -180,6 +175,9 @@ class SyncPowerNorm(nn.Module):
                f'affine={self.affine}, warmup={self.warmup_iters}'
 
     def forward(self, input):
+        B, T, C = input.size()
+        assert C == self.num_features, f"Input features {C} doesn't match num_features {self.num_features}"
+
         if self.training:
             self.iters.add_(1)
             output = SyncPowerFunction.apply(input, self.weight, self.bias, self.running_phi, self.eps,
@@ -188,9 +186,9 @@ class SyncPowerNorm(nn.Module):
         else:
             var = self.running_phi
             output = input * torch.rsqrt(var + self.eps)
-            output = self.weight.reshape(1, 1, self.num_features) * output + self.bias.reshape(1, 1, self.num_features)
+            output = self.weight.view(1, 1, C) * output + self.bias.view(1, 1, C)
 
-        return output
+        return output # Shape: (B, T, C)
 
 # -----------------------------------------------------------------------------
 
