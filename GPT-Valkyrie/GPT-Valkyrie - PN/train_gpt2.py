@@ -87,7 +87,7 @@ class SyncPowerFunction(torch.autograd.Function):
         ctx.world_size = world_size
 
         B, T, C = x.size()
-        x2 = (x * x).mean(dim=(0)) # only changing from batch, since this is how BN works?
+        x2 = torch.mean(torch.square(x), dim=(0, 1)) # REFER TO why 0 is needed instead:  https://claude.ai/chat/e295478e-0d72-4e79-a4f2-47048d964170 // looks like we have settled to simply manipulating batch instead
 
         var = x2.reshape(1, 1, C)
 
@@ -95,9 +95,9 @@ class SyncPowerFunction(torch.autograd.Function):
             dist.all_reduce(var, op=dist.ReduceOp.AVG, group=process_group)
 
         if current_iter <= warmup_iters:
-            z = x / (var + eps).sqrt()
+            z = torch.rsqrt(var + eps) * x
         else:
-            z = x / (running_phi + eps).sqrt()
+            z = torch.rsqrt(running_phi + eps) * x
 
         y = z
         ctx.save_for_backward(z, var, weight, ema_gz)
@@ -127,17 +127,17 @@ class SyncPowerFunction(torch.autograd.Function):
         y = z
         g = grad_output * weight.reshape(1, 1, C)
 
-        gz = (g * z).mean(dim=(0, 1))
+        gz = torch.mean(g * z, dim=(0, 1))
 
         approx_grad_g = (g - (1 - abkw) * ema_gz * z)
-        ema_gz.add_((approx_grad_g * z).mean(dim=(0, 1), keepdim=True))
+        ema_gz.add_(torch.mean(approx_grad_g * z, dim=(0, 1), keepdim=True))
 
         if ctx.process_group is not None:
             dist.all_reduce(ema_gz, op=dist.ReduceOp.AVG, group=ctx.process_group)
 
-        gx = 1. / torch.sqrt(var + eps) * approx_grad_g 
-        grad_weight = (grad_output * y).sum(dim=(0, 1))
-        grad_bias = grad_output.sum(dim=(0, 1))
+        gx = torch.rsqrt(var + eps) * approx_grad_g 
+        grad_weight = torch.sum(grad_output * y, dim=(0, 1))
+        grad_bias = torch.sum(grad_output, dim=(0, 1))
 
         if ctx.process_group is not None:
             process_group = ctx.process_group
@@ -187,7 +187,7 @@ class SyncPowerNorm(nn.Module):
                         self.process_group, self.world_size)
         else:
             var = self.running_phi
-            output = input / (var + self.eps).sqrt()
+            output = input * torch.rsqrt(var + self.eps)
             output = self.weight.reshape(1, 1, self.num_features) * output + self.bias.reshape(1, 1, self.num_features)
 
         return output
