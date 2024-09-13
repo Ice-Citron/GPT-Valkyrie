@@ -282,9 +282,8 @@ class SyncMaskPowerNorm(nn.Module):
         self.process_group = process_group
         self.world_size = dist.get_world_size(process_group) if process_group else 1
 
-        self.weight = nn.Parameter(torch.ones(num_features))
-        self.bias = nn.Parameter(torch.zeros(num_features))
-        
+        self.register_parameter('weight', nn.Parameter(torch.ones(num_features)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(num_features)))
         self.register_buffer('running_phi', torch.ones(1,num_features,1,1))
         self.register_buffer('ema_gz', torch.zeros(1,num_features,1,1))
         self.register_buffer('iters', torch.zeros(1).type(torch.LongTensor))
