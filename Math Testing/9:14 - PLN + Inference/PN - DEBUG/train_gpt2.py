@@ -528,6 +528,30 @@ def get_most_likely_row(tokens, mask, logits):
     pred_norm = avg_loss.argmin().item()
     return pred_norm
 
+
+
+def log_detailed_powernorm_stats(model, step):
+    stats = {}
+    for name, module in model.named_modules():
+        if isinstance(module, SyncPowerNorm):
+            stats[f"{name}/running_phi_min"] = module.running_phi.min().item()
+            stats[f"{name}/running_phi_max"] = module.running_phi.max().item()
+            stats[f"{name}/running_phi_mean"] = module.running_phi.mean().item()
+            stats[f"{name}/ema_gz_min"] = module.ema_gz.min().item()
+            stats[f"{name}/ema_gz_max"] = module.ema_gz.max().item()
+            stats[f"{name}/ema_gz_mean"] = module.ema_gz.mean().item()
+            stats[f"{name}/weight_min"] = module.weight.min().item() if module.weight is not None else None
+            stats[f"{name}/weight_max"] = module.weight.max().item() if module.weight is not None else None
+            stats[f"{name}/bias_min"] = module.bias.min().item() if module.bias is not None else None
+            stats[f"{name}/bias_max"] = module.bias.max().item() if module.bias is not None else None
+    
+    if master_process:
+        log_metrics(stats)
+        print(f"Step {step} PowerNorm stats:")
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+
+
 # -----------------------------------------------------------------------------
 # simple launch:
 # python train_gpt2.py
@@ -594,7 +618,7 @@ config = {
     "max_generate_length": 32,
     "top_k": 50,
 
-    "resume_from_checkpoint": False,
+    "resume_from_checkpoint": True,
 }
 
 args = Namespace(**config)
@@ -837,6 +861,10 @@ for step in range(starting_step, max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
+
+    grad_norms = [] # NEW
+    param_norms = []
+
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -852,36 +880,83 @@ for step in range(starting_step, max_steps):
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
+
+    if step >= 2000:
+        log_detailed_powernorm_stats(raw_model, step)
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # grad_clip == 1.0 by default
+
+    # Check for NaN or inf values in gradients and log gradient statistics
+    grad_stats = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            grad_norms.append(grad_norm)
+            grad_stats[f"grad_norm/{name}"] = grad_norm
+            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                print(f"Step {step}: NaN or inf detected in gradients of {name}")
+                grad_stats[f"grad_nan_inf/{name}"] = 1
+            else:
+                grad_stats[f"grad_nan_inf/{name}"] = 0
+
+
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
+
+    # Check for NaN or inf values in model parameters and log parameter statistics
+    param_stats = {}
+    for name, param in model.named_parameters():
+        param_norm = param.norm().item()
+        param_norms.append(param_norm)
+        param_stats[f"param_norm/{name}"] = param_norm
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"Step {step}: NaN or inf detected in parameters of {name}")
+            param_stats[f"param_nan_inf/{name}"] = 1
+        else:
+            param_stats[f"param_nan_inf/{name}"] = 0
+
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
+
     if master_process:
         pn_stats = log_powernorm_stats(raw_model)
         log_metrics({
-            "lr": lr, # get_lr()
+            "lr": lr,
             "samples": step * samples_per_step,
             "steps": step,
             "loss/train": loss_accum.item(),
-            # file specific addition
             "global gradient norm": norm,
             "dt": dt,
             "tok per sec": tokens_per_sec,
-            **pn_stats  # Unpack the PowerNorm stats into the metrics
+            "grad_norm/mean": np.mean(grad_norms),
+            "grad_norm/median": np.median(grad_norms),
+            "grad_norm/max": np.max(grad_norms),
+            "grad_norm/min": np.min(grad_norms),
+            "param_norm/mean": np.mean(param_norms),
+            "param_norm/median": np.median(param_norms),
+            "param_norm/max": np.max(param_norms),
+            "param_norm/min": np.min(param_norms),
+            **pn_stats,
+            **grad_stats,
+            **param_stats
         })
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+    # Break the loop if NaN is detected in loss
+    if torch.isnan(loss_accum) or torch.isinf(loss_accum):
+        print(f"NaN or inf detected in loss at step {step}. Stopping training.")
+        break
 
 if ddp:
     destroy_process_group()
