@@ -24,6 +24,7 @@ import logging
 import glob
 
 # -----------------------------------------------------------------------------
+os.environ['NUMEXPR_MAX_THREADS'] = '96'
 
 class CausalSelfAttention(nn.Module):
 
@@ -110,8 +111,6 @@ class SyncPowerFunction(torch.autograd.Function):
         eps = ctx.eps
         abkw = ctx.abkw
 
-        B, T, C = grad_output.size()
-
         y, var, weight, ema_gz = ctx.saved_tensors
 
         if ctx.affine:
@@ -141,7 +140,7 @@ class SyncPowerFunction(torch.autograd.Function):
 
 class SyncPowerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-5, alpha_fwd=0.9, alpha_bkw=0.9,
-                 affine=True, warmup_iters=10000, process_group=None):
+                 affine=True, warmup_iters=2000, process_group=None): # warmup_iters set to 10% of total iterations
         super().__init__()
 
         self.num_features = num_features
@@ -158,11 +157,13 @@ class SyncPowerNorm(nn.Module):
 
         self.running_phi = nn.Parameter(torch.ones(1, 1, num_features), requires_grad=False)
         self.ema_gz = nn.Parameter(torch.zeros(1, 1, num_features), requires_grad=False)
-        self.iters = nn.Parameter(torch.zeros(1, dtype=torch.long), requires_grad=False)
+        self.iters = nn.Parameter(torch.ones(1, dtype=torch.long), requires_grad=False)
 
         self.afwd = alpha_fwd
         self.abkw = alpha_bkw
         self.warmup_iters = warmup_iters
+        self.grad_accum_steps = args.gradient_accumulation_steps
+        self.accum_count = 0
 
     def extra_repr(self):
         return f'{self.num_features}, eps={self.eps}, alpha_fwd={self.afwd}, alpha_bkw={self.abkw}, ' \
@@ -173,7 +174,11 @@ class SyncPowerNorm(nn.Module):
         assert C == self.num_features, f"Input features {C} doesn't match num_features {self.num_features}"
 
         if self.training:
-            self.iters.add_(1)
+            self.accum_count += 1
+            if self.accum_count >= self.grad_accum_steps:
+                self.iters.add_(1)
+                self.accum_count = 0
+
             output = SyncPowerFunction.apply(input, self.weight if self.affine else None, self.bias if self.affine else None,
                                          self.running_phi, self.eps, self.afwd, self.abkw, self.ema_gz, self.warmup_iters, self.iters,
                                          self.process_group, self.affine)
@@ -488,6 +493,15 @@ def load_checkpoint(checkpoint_path, model, optimizer, train_loader, val_loader)
 
     return checkpoint['step'], checkpoint['val_loss'], checkpoint['run_name'], checkpoint['wandb_id']
 
+# logging powernorm stats
+def log_powernorm_stats(model):
+    stats = {}
+    for name, module in model.named_modules():
+        if isinstance(module, SyncPowerNorm):
+            stats[f"{name}/running_phi"] = module.running_phi.mean().item()
+            stats[f"{name}/ema_gz"] = module.ema_gz.mean().item()
+            stats[f"{name}/iters"] = module.iters.item()
+    return stats
 
 
 # -----------------------------------------------------------------------------
@@ -579,7 +593,7 @@ config = {
     "max_generate_length": 32,
     "top_k": 50,
 
-    "resume_from_checkpoint": False,
+    "resume_from_checkpoint": True,
 }
 
 args = Namespace(**config)
@@ -673,7 +687,7 @@ if args.resume_from_checkpoint:
     checkpoint_dir = args.log_dir
     checkpoint_pattern = os.path.join(checkpoint_dir, "checkpoint_*.pt")
     checkpoint_files = glob.glob(checkpoint_pattern)
-    latest_checkpoint = max(checkpoint_files, key=os.path.getctime)
+    latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.split('_')[-1].split('.')[0])) # Find the checkpoint with the highest number
     checkpoint_path = latest_checkpoint
 
     # Use the load_checkpoint function here
@@ -852,6 +866,7 @@ for step in range(starting_step, max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
+        pn_stats = log_powernorm_stats(raw_model)
         log_metrics({
             "lr": lr, # get_lr()
             "samples": step * samples_per_step,
@@ -860,7 +875,8 @@ for step in range(starting_step, max_steps):
             # file specific addition
             "global gradient norm": norm,
             "dt": dt,
-            "tok per sec": tokens_per_sec
+            "tok per sec": tokens_per_sec,
+            **pn_stats  # Unpack the PowerNorm stats into the metrics
         })
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:

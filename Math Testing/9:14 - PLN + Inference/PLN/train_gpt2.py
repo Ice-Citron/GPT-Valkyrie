@@ -865,7 +865,7 @@ for step in range(starting_step, max_steps):
             # file specific addition
             "global gradient norm": norm,
             "dt": dt,
-            "tok per sec": tokens_per_sec,
+            "tok per sec": tokens_per_sec
             **pln_stats  # Unpack the PLN stats into the metrics 
         })
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
