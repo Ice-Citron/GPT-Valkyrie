@@ -95,8 +95,8 @@ class SyncPowerFunction(torch.autograd.Function):
         ctx.save_for_backward(y, var, weight, ema_gz)
 
         if current_iter < warmup_iters:
-            running_phi.copy_(running_phi * (current_iter-1)/current_iter + var.mean(dim=-1, keepdim=True)/current_iter) # MISTAKE? UNSURE
-        running_phi.copy_(afwd*running_phi + (1-afwd)*var.mean(dim=-1, keepdim=True)) # MISTAKE? UNSURE
+            running_phi.copy_(running_phi * (current_iter-1)/current_iter + var/current_iter) # MISTAKE? UNSURE
+        running_phi.copy_(afwd*running_phi + (1-afwd)*var) # MISTAKE? UNSURE
 
         if process_group is not None and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
             torch.distributed.all_reduce(running_phi, op=torch.distributed.ReduceOp.AVG, group=process_group)
@@ -111,11 +111,11 @@ class SyncPowerFunction(torch.autograd.Function):
         eps = ctx.eps
         abkw = ctx.abkw
 
-        B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
+        # B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
         y, var, weight, ema_gz = ctx.saved_tensors
         
         if ctx.affine:
-            g = grad_output * weight.reshape(1, 1, C)
+            g = grad_output * weight.reshape(1, 1, -1)    # Shape: (B, T, C)
         else:
             g = grad_output
 
@@ -888,37 +888,11 @@ for step in range(starting_step, max_steps):
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # grad_clip == 1.0 by default
 
-    # Check for NaN or inf values in gradients and log gradient statistics
-    grad_stats = {}
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            grad_norms.append(grad_norm)
-            grad_stats[f"grad_norm/{name}"] = grad_norm
-            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                print(f"Step {step}: NaN or inf detected in gradients of {name}")
-                grad_stats[f"grad_nan_inf/{name}"] = 1
-            else:
-                grad_stats[f"grad_nan_inf/{name}"] = 0
-
-
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-
-    # Check for NaN or inf values in model parameters and log parameter statistics
-    param_stats = {}
-    for name, param in model.named_parameters():
-        param_norm = param.norm().item()
-        param_norms.append(param_norm)
-        param_stats[f"param_norm/{name}"] = param_norm
-        if torch.isnan(param).any() or torch.isinf(param).any():
-            print(f"Step {step}: NaN or inf detected in parameters of {name}")
-            param_stats[f"param_nan_inf/{name}"] = 1
-        else:
-            param_stats[f"param_nan_inf/{name}"] = 0
 
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
@@ -927,6 +901,24 @@ for step in range(starting_step, max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
 
+    # Helper function to safely compute statistics
+    def safe_stats(values):
+        if not values:  # If the list is empty
+            return {
+                "mean": 0,
+                "median": 0,
+                "max": 0,
+                "min": 0
+            }
+        return {
+            "mean": np.mean(values),
+            "median": np.median(values),
+            "max": np.max(values),
+            "min": np.min(values)
+        }
+
+    grad_norm_stats = safe_stats(grad_norms)
+    param_norm_stats = safe_stats(param_norms)
     if master_process:
         pn_stats = log_powernorm_stats(raw_model)
         log_metrics({
@@ -937,17 +929,17 @@ for step in range(starting_step, max_steps):
             "global gradient norm": norm,
             "dt": dt,
             "tok per sec": tokens_per_sec,
-            "grad_norm/mean": np.mean(grad_norms),
-            "grad_norm/median": np.median(grad_norms),
-            "grad_norm/max": np.max(grad_norms),
-            "grad_norm/min": np.min(grad_norms),
-            "param_norm/mean": np.mean(param_norms),
-            "param_norm/median": np.median(param_norms),
-            "param_norm/max": np.max(param_norms),
-            "param_norm/min": np.min(param_norms),
+            "grad_norm/mean": grad_norm_stats["mean"],
+            "grad_norm/median": grad_norm_stats["median"],
+            "grad_norm/max": grad_norm_stats["max"],
+            "grad_norm/min": grad_norm_stats["min"],
+            "param_norm/mean": param_norm_stats["mean"],
+            "param_norm/median": param_norm_stats["median"],
+            "param_norm/max": param_norm_stats["max"],
+            "param_norm/min": param_norm_stats["min"],
             **pn_stats,
-            **grad_stats,
-            **param_stats
+            **grad_norm_stats,
+            **param_norm_stats
         })
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
