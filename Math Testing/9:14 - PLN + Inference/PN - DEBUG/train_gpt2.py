@@ -95,8 +95,8 @@ class SyncPowerFunction(torch.autograd.Function):
         ctx.save_for_backward(y, var, weight, ema_gz)
 
         if current_iter < warmup_iters:
-            running_phi.copy_(running_phi * (current_iter-1)/current_iter + var/current_iter) # MISTAKE? UNSURE
-        running_phi.copy_(afwd*running_phi + (1-afwd)*var) # MISTAKE? UNSURE
+            running_phi.copy_(running_phi * (current_iter-1)/current_iter + torch.mean(var, dim=-1, keepdim=True)/current_iter) # MISTAKE? UNSURE
+        running_phi.copy_(afwd*running_phi + (1-afwd)*torch.mean(var, dim=-1, keepdim=True)) # MISTAKE? UNSURE
 
         if process_group is not None and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
             torch.distributed.all_reduce(running_phi, op=torch.distributed.ReduceOp.AVG, group=process_group)
@@ -709,10 +709,11 @@ if master_process:
 starting_step = 0
 
 if args.resume_from_checkpoint:
+    import re
     checkpoint_dir = args.log_dir
     checkpoint_pattern = os.path.join(checkpoint_dir, "checkpoint_*.pt")
     checkpoint_files = glob.glob(checkpoint_pattern)
-    latest_checkpoint = max(checkpoint_files, key=os.path.getctime)
+    latest_checkpoint = max(checkpoint_files, key=lambda f: int(re.search(r'checkpoint_(\d+)\.pt', f).group(1)))
     checkpoint_path = latest_checkpoint
 
     # Use the load_checkpoint function here
@@ -775,6 +776,7 @@ for step in range(starting_step, max_steps):
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        log_metrics({"loss/validation": val_loss_accum.item()})
 
     # once in a while evaluate hellaswag
     if (step % args.hellaswag_every == 0 or last_step) and (not use_compile):
@@ -855,7 +857,7 @@ for step in range(starting_step, max_steps):
             )
             hf_repo.push_to_hub(commit_message=f"Checkpoint at step {step}")
             print(f"Saved checkpoint and pushed to HuggingFace at step {step}")
-            log_metrics({"loss/validation": val_loss_accum.item()})
+            # log_metrics({"loss/validation": val_loss_accum.item()})
 
     # do one step of the optimization
     model.train()

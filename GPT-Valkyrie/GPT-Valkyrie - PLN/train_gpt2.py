@@ -740,6 +740,7 @@ for step in range(starting_step, max_steps):
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        log_metrics({"loss/validation": val_loss_accum.item()})
 
     # once in a while evaluate hellaswag
     if (step % args.hellaswag_every == 0 or last_step) and (not use_compile):
@@ -820,7 +821,7 @@ for step in range(starting_step, max_steps):
             )
             hf_repo.push_to_hub(commit_message=f"Checkpoint at step {step}")
             print(f"Saved checkpoint and pushed to HuggingFace at step {step}")
-            log_metrics({"loss/validation": val_loss_accum.item()})
+            # log_metrics({"loss/validation": val_loss_accum.item()})
 
     # do one step of the optimization
     model.train()
