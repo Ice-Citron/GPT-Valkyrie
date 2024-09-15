@@ -95,10 +95,10 @@ class SyncPowerFunction(torch.autograd.Function):
         ctx.save_for_backward(y, var, weight, ema_gz)
 
         if current_iter < warmup_iters:
-            running_phi.copy_(running_phi * (current_iter-1)/current_iter + var.mean(dim=-1, keepdim=True)/current_iter) # MISTAKE? UNSURE
-        running_phi.copy_(afwd*running_phi + (1-afwd)*var.mean(dim=-1, keepdim=True)) # MISTAKE? UNSURE
+            running_phi.copy_(running_phi * (current_iter-1)/current_iter + var/current_iter) # MISTAKE? UNSURE <-- I think its correct, because we want to value for every feature inside dim=-1 calculated across the batch
+        running_phi.copy_(afwd*running_phi + (1-afwd)*var) # MISTAKE? UNSURE
 
-        if process_group is not None and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
+        if process_group is not None: # and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
             torch.distributed.all_reduce(running_phi, op=torch.distributed.ReduceOp.AVG, group=process_group)
 
         if affine:
@@ -111,18 +111,18 @@ class SyncPowerFunction(torch.autograd.Function):
         eps = ctx.eps
         abkw = ctx.abkw
 
-        B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
+        # B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
         y, var, weight, ema_gz = ctx.saved_tensors
         
         if ctx.affine:
-            g = grad_output * weight.reshape(1, 1, C)
+            g = grad_output * weight.reshape(1, 1, -1)    # Shape: (B, T, C)
         else:
             g = grad_output
 
         approx_grad_g = (g - (1 - abkw) * ema_gz * y)
         ema_gz.add_(torch.mean(approx_grad_g * y, dim=(0, 1), keepdim=True))
 
-        if ctx.process_group is not None and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
+        if ctx.process_group is not None: # and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
             dist.all_reduce(ema_gz, op=dist.ReduceOp.AVG, group=ctx.process_group)
 
         gx = torch.rsqrt(var + eps) * approx_grad_g         # so this is interpreted as: "(1. / torch.sqrt(var + eps)) * approx_grad_g"
@@ -141,7 +141,7 @@ class SyncPowerFunction(torch.autograd.Function):
 
 class SyncPowerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-3, alpha_fwd=0.9, alpha_bkw=0.9,
-                 affine=True, warmup_iters=2000, process_group=None): # warmup_iters set to 10% of total iterations
+                 affine=True, warmup_iters=200, process_group=None): # warmup_iters set to 10% of total iterations
         super().__init__()
 
         self.num_features = num_features
@@ -478,7 +478,6 @@ def save_checkpoint(model, optimizer, step, val_loss, run_name, train_loader_sta
         'train_loader_state': train_loader_state,
         'val_loader_state': val_loader_state,
         'wandb_id': wandb_id,
-        'power_norm_stats': {},
     }
 
     checkpoint_path = os.path.join(log_dir, f"checkpoint_{step}.pt")
@@ -751,6 +750,7 @@ for step in range(starting_step, max_steps):
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        log_metrics({"loss/validation": val_loss_accum.item()})
 
     # once in a while evaluate hellaswag
     if (step % args.hellaswag_every == 0 or last_step) and (not use_compile):
@@ -831,7 +831,6 @@ for step in range(starting_step, max_steps):
             )
             hf_repo.push_to_hub(commit_message=f"Checkpoint at step {step}")
             print(f"Saved checkpoint and pushed to HuggingFace at step {step}")
-            log_metrics({"loss/validation": val_loss_accum.item()})
 
     # do one step of the optimization
     model.train()
