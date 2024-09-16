@@ -74,18 +74,39 @@ class MLP(nn.Module):
 
 # -----------------------------------------------------------------------------
 
+# given up
+class GroupScaling1D(nn.Module):
+    def __init__(self, eps=1e-5, group_num=1):
+        super(GroupScaling1D, self).__init__()
+        self.eps = eps
+        self.group_num = group_num
+
+    def extra_repr(self):
+        return f'eps={self.eps}, group={self.group_num}'
+
+    def forward(self, input):
+        B, T, C = input.shape
+        if self.group_num == 1:
+            moment2 = torch.mean(torch.square(input), dim=-1, keepdim=True)
+        else:
+            Cg = C // self.group_num
+            input = input.view(B, T, self.group_num, Cg)
+            moment2 = torch.mean(input * input, dim=-1, keepdim=True)
+            moment2 = moment2.repeat(1, 1, 1, Cg).view(B, T, C)
+        return input / torch.sqrt(moment2 + self.eps)
+
 class SyncPowerFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, running_phi, eps, afwd, abkw, ema_gz, warmup_iters, current_iter, process_group, affine):
         ctx.affine = affine
         ctx.eps = eps
         current_iter = current_iter.item()
-        ctx.abkw = abkw
         ctx.process_group = process_group
+        ctx.abkw = abkw
 
-        B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
-        x2 = torch.mean(torch.square(x), dim=(0, 1)) # REFER TO why 0 is needed instead:  https://claude.ai/chat/e295478e-0d72-4e79-a4f2-47048d964170 // looks like we have settled to simply manipulating batch instead
-        var = x2.reshape(1, 1, C)  # Shape: (1, 1, C) /// # CHANGE: Use view instead of reshape to avoid potential copies // var = x2.reshape(1, 1, C)
+        B, T, C = x.size()
+        x2 = torch.mean(torch.square(x), dim=(0, 1))
+        var = x2.view(1, 1, C)
 
         if current_iter <= warmup_iters:
             y = x * torch.rsqrt(var + eps) # Shape: (B, T, C)
@@ -102,30 +123,29 @@ class SyncPowerFunction(torch.autograd.Function):
             torch.distributed.all_reduce(running_phi, op=torch.distributed.ReduceOp.AVG, group=process_group)
 
         if affine:
-            y = weight.reshape(1, 1, C) * y + bias.reshape(1, 1, C) # Shape: (B, T, C)        # CHANGE: Use view for weight and bias, maintain B, T, C shape // https://claude.ai/chat/0f44cae4-e15c-4c3d-acd1-7fef7701356b
+            y = weight.view(1, 1, C) * y + bias.view(1, 1, C)
 
-        return y # Shape: (B, T, C)
+        return y
 
     @staticmethod
     def backward(ctx, grad_output):
         eps = ctx.eps
         abkw = ctx.abkw
 
-        # B, T, C = x.size()                           # Batch size, Sequence length, Channel (embedding, FEATURE) size
         y, var, weight, ema_gz = ctx.saved_tensors
         
         if ctx.affine:
-            g = grad_output * weight.reshape(1, 1, -1)    # Shape: (B, T, C)
+            g = grad_output * weight.view(1, 1, -1)
         else:
             g = grad_output
 
-        approx_grad_g = (g - (1 - abkw) * ema_gz * y)
+        approx_grad_g = g - (1 - abkw) * ema_gz * y
         ema_gz.add_(torch.mean(approx_grad_g * y, dim=(0, 1), keepdim=True))
 
         if ctx.process_group is not None: # and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
             dist.all_reduce(ema_gz, op=dist.ReduceOp.AVG, group=ctx.process_group)
 
-        gx = torch.rsqrt(var + eps) * approx_grad_g         # so this is interpreted as: "(1. / torch.sqrt(var + eps)) * approx_grad_g"
+        gx = torch.rsqrt(var + eps) * approx_grad_g
 
         if ctx.affine:
             grad_weight = torch.sum(grad_output * y, dim=(0, 1))
@@ -137,11 +157,11 @@ class SyncPowerFunction(torch.autograd.Function):
             grad_weight = None
             grad_bias = None
 
-        return gx, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None, None
+        return gx, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None
 
 class SyncPowerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-3, alpha_fwd=0.9, alpha_bkw=0.9,
-                 affine=True, warmup_iters=200, process_group=None): # warmup_iters set to 10% of total iterations
+                 affine=True, warmup_iters=715, process_group=None, group_num=1):
         super().__init__()
 
         self.num_features = num_features
@@ -156,15 +176,17 @@ class SyncPowerNorm(nn.Module):
             self.weight = None
             self.bias = None
 
-        self.running_phi = nn.Parameter(torch.ones(1, 1, num_features), requires_grad=False)
-        self.ema_gz = nn.Parameter(torch.zeros(1, 1, num_features), requires_grad=False)
-        self.iters = nn.Parameter(torch.ones(1, dtype=torch.long), requires_grad=False)
+        self.register_buffer('running_phi', torch.ones(1, 1, num_features))     # I THINK THIS IS LIKELY THE ISSUE, ITS NOT MEANT TO BE A PARAMETER BUT WE ARE TREATING IT LIKE ONE???
+        self.register_buffer('ema_gz', torch.zeros(1, 1, num_features))
+        self.register_buffer('iters', torch.ones(1).type(torch.LongTensor))
 
         self.afwd = alpha_fwd
         self.abkw = alpha_bkw
+
         self.warmup_iters = warmup_iters
         self.grad_accum_steps = args.gradient_accumulation_steps
         self.accum_count = 0
+        self.group_scaling = GroupScaling1D(eps=eps, group_num=group_num)
 
     def extra_repr(self):
         return f'{self.num_features}, eps={self.eps}, alpha_fwd={self.afwd}, alpha_bkw={self.abkw}, ' \
@@ -173,6 +195,9 @@ class SyncPowerNorm(nn.Module):
     def forward(self, input):
         B, T, C = input.size()
         assert C == self.num_features, f"Input features {C} doesn't match num_features {self.num_features}"
+
+        # Apply GroupScaling1D
+        input = self.group_scaling(input)
 
         if self.training:
             self.accum_count += 1
@@ -498,11 +523,16 @@ def log_powernorm_stats(model):
     stats = {}
     for name, module in model.named_modules():
         if isinstance(module, SyncPowerNorm):
-            stats[f"{name}/running_phi"] = module.running_phi.mean().item()
-            stats[f"{name}/ema_gz"] = module.ema_gz.mean().item()
-            stats[f"{name}/iters"] = module.iters.item()
+            running_phi = module.get_buffer('running_phi')
+            if running_phi is not None:
+                stats[f"{name}/running_phi"] = running_phi.mean().item()
+            ema_gz = module.get_buffer('ema_gz')
+            if ema_gz is not None:
+                stats[f"{name}/ema_gz"] = ema_gz.mean().item()
+            iters = module.get_buffer('iters')
+            if iters is not None:
+                stats[f"{name}/iters"] = iters.item()
     return stats
-
 
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
@@ -569,18 +599,18 @@ else:
 config = {
     "weight_decay": 0.1,
     # "lr_scheduler_type": "cosine",
-    "gradient_accumulation_steps": (2**19) // (64 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
+    "gradient_accumulation_steps": (2**16 * 7) // (56 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
     "max_eval_steps": 20,
     "seq_length": 1024,
 
     # New centralised parameters
     "project_name": "shng2025/GPT-Valkyrie_PN-124m",
-    "total_batch_size": 2**19, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
-    "micro_batch_size": 64,
+    "total_batch_size": 2**16 * 7, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
+    "micro_batch_size": 56,
     "max_lr": 6e-4,
     "min_lr": 6e-5,  # 10% of max_lr // not used, as we are using weight_decay instead
     "warmup_steps": 715,
-    "max_steps": 19073, # had to be scaled up after 2001st step, as memory ran out when DDP
+    "max_steps": 21797, # had to be scaled up after 2001st step, as memory ran out when DDP
     "val_every": 500,           # EVALUATION
     "generate_every": 500,      # EVALUATION
     "hellaswag_every": 500,     # EVALUATION
@@ -822,7 +852,7 @@ for step in range(starting_step, max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
-    if step % args.save_every == 0 or last_step:
+    if (step % args.save_every == 0 or last_step) and step > 0:
         if master_process:
             # Save checkpoint and push to HuggingFace
             checkpoint_path = save_checkpoint(
@@ -836,6 +866,7 @@ for step in range(starting_step, max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
+
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -850,15 +881,41 @@ for step in range(starting_step, max_steps):
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        loss.backward()
+        
+        # Add NaN check here
+        if not torch.isnan(loss):
+            loss.backward()
+        else:
+            print(f"NaN loss detected at step {step}, micro_step {micro_step}. Skipping backward.")
+            if master_process:
+                wandb.alert(
+                    title="NaN Loss Detected",
+                    text=f"NaN loss detected at step {step}, micro_step {micro_step}. Skipping backward.",
+                    level=wandb.AlertLevel.WARN
+                )
+            break
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # grad_clip == 1.0 by default
-    # determine and set the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
+
+    # Add another NaN check here before optimizer step
+    if not torch.isnan(loss_accum):
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) # grad_clip == 1.0 by default
+        # determine and set the learning rate for this iteration
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+    else:
+        print("successfully broke")
+        print(f"NaN accumulated loss detected at step {step}. Skipping optimizer step.")
+        wandb.alert(
+            title="NaN Accumulated Loss Detected",
+            text=f"NaN accumulated loss detected at step {step}. Skipping optimizer step.",
+            level=wandb.AlertLevel.ERROR
+        )
+        break
+
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
