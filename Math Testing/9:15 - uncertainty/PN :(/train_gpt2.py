@@ -848,7 +848,7 @@ for step in range(starting_step, max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
-    nan_count = 0  # Counter for NaN occurrences in this step
+
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -876,6 +876,7 @@ for step in range(starting_step, max_steps):
                     text=f"NaN loss detected at step {step}, micro_step {micro_step}. Skipping backward.",
                     level=wandb.AlertLevel.WARN
                 )
+            break
 
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
@@ -889,16 +890,14 @@ for step in range(starting_step, max_steps):
             param_group['lr'] = lr
         optimizer.step()
     else:
+        print("successfully broke")
         print(f"NaN accumulated loss detected at step {step}. Skipping optimizer step.")
         wandb.alert(
             title="NaN Accumulated Loss Detected",
             text=f"NaN accumulated loss detected at step {step}. Skipping optimizer step.",
             level=wandb.AlertLevel.ERROR
         )
-
-    # Log NaN count
-    if master_process and nan_count > 0:
-        wandb.log({"nan_count": nan_count}, step=step)  
+        break
 
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work

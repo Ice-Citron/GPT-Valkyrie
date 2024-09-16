@@ -74,21 +74,35 @@ class MLP(nn.Module):
 
 # -----------------------------------------------------------------------------
 
+# given up
+class GroupScaling1D(nn.Module):
+    def __init__(self, eps=1e-5, group_num=1):
+        super(GroupScaling1D, self).__init__()
+        self.eps = eps
+        self.group_num = group_num
+
+    def extra_repr(self):
+        return f'eps={self.eps}, group={self.group_num}'
+
+    def forward(self, input):
+        B, T, C = input.shape
+        if self.group_num == 1:
+            moment2 = torch.mean(input * input, dim=-1, keepdim=True)
+        else:
+            Cg = C // self.group_num
+            input = input.view(B, T, self.group_num, Cg)
+            moment2 = torch.mean(input * input, dim=-1, keepdim=True)
+            moment2 = moment2.repeat(1, 1, 1, Cg).view(B, T, C)
+        return input / torch.sqrt(moment2 + self.eps)
+
 class SyncPowerFunction(torch.autograd.Function):
     @staticmethod
-    def get_alpha(current_iter, alpha_init, alpha_final, warmup_iters, total_iters):
-        if current_iter <= warmup_iters:
-            return alpha_init
-        else:
-            progress = min((current_iter - warmup_iters) / (total_iters - warmup_iters), 1.0)
-            return alpha_init + (alpha_final - alpha_init) * progress
-
-    @staticmethod
-    def forward(ctx, x, weight, bias, running_phi, eps, alpha_init, alpha_final, ema_gz, warmup_iters, current_iter, process_group, affine):
+    def forward(ctx, x, weight, bias, running_phi, eps, afwd, abkw, ema_gz, warmup_iters, current_iter, process_group, affine):
         ctx.affine = affine
         ctx.eps = eps
         current_iter = current_iter.item()
         ctx.process_group = process_group
+        ctx.abkw = abkw
 
         B, T, C = x.size()
         x2 = torch.mean(torch.square(x), dim=(0, 1))
@@ -100,11 +114,10 @@ class SyncPowerFunction(torch.autograd.Function):
             y = x * torch.rsqrt(running_phi + eps) # Shape: (B, T, C)
 
         ctx.save_for_backward(y, var, weight, ema_gz)
-        ctx.alpha = SyncPowerFunction.get_alpha(current_iter, alpha_init, alpha_final, warmup_iters, 19073)
 
         if current_iter < warmup_iters:
             running_phi.copy_(running_phi * (current_iter-1)/current_iter + var/current_iter) # MISTAKE? UNSURE <-- I think its correct, because we want to value for every feature inside dim=-1 calculated across the batch
-        running_phi.copy_(ctx.alpha*running_phi + (1-ctx.alpha)*var) # MISTAKE? UNSURE
+        running_phi.copy_(afwd*running_phi + (1-afwd)*var) # MISTAKE? UNSURE
 
         if process_group is not None: # and (current_iter % 100 or current_iter == args.max_steps): # experimental, to try and reduce time spent accessing memory
             torch.distributed.all_reduce(running_phi, op=torch.distributed.ReduceOp.AVG, group=process_group)
@@ -147,8 +160,8 @@ class SyncPowerFunction(torch.autograd.Function):
         return gx, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None
 
 class SyncPowerNorm(nn.Module):
-    def __init__(self, num_features, eps=1e-3, alpha_init=0.9, alpha_final=0.99999,
-                 affine=True, warmup_iters=715, process_group=None):
+    def __init__(self, num_features, eps=1e-3, alpha_fwd=0.9, alpha_bkw=0.9,
+                 affine=True, warmup_iters=715, process_group=None, group_num=1):
         super().__init__()
 
         self.num_features = num_features
@@ -167,11 +180,13 @@ class SyncPowerNorm(nn.Module):
         self.register_buffer('ema_gz', torch.zeros(1, 1, num_features))
         self.register_buffer('iters', torch.ones(1).type(torch.LongTensor))
 
-        self.alpha_init = alpha_init
-        self.alpha_final = alpha_final
+        self.afwd = alpha_fwd
+        self.abkw = alpha_bkw
+
         self.warmup_iters = warmup_iters
         self.grad_accum_steps = args.gradient_accumulation_steps
         self.accum_count = 0
+        self.group_scaling = GroupScaling1D(eps=eps, group_num=group_num)
 
     def extra_repr(self):
         return f'{self.num_features}, eps={self.eps}, alpha_fwd={self.afwd}, alpha_bkw={self.abkw}, ' \
@@ -181,6 +196,9 @@ class SyncPowerNorm(nn.Module):
         B, T, C = input.size()
         assert C == self.num_features, f"Input features {C} doesn't match num_features {self.num_features}"
 
+        # Apply GroupScaling1D
+        input = self.group_scaling(input)
+
         if self.training:
             self.accum_count += 1
             if self.accum_count >= self.grad_accum_steps:
@@ -188,7 +206,7 @@ class SyncPowerNorm(nn.Module):
                 self.accum_count = 0
 
             output = SyncPowerFunction.apply(input, self.weight if self.affine else None, self.bias if self.affine else None,
-                                         self.running_phi, self.eps, self.alpha_init, self.alpha_final, self.ema_gz, self.warmup_iters, self.iters,
+                                         self.running_phi, self.eps, self.afwd, self.abkw, self.ema_gz, self.warmup_iters, self.iters,
                                          self.process_group, self.affine)
         else:
             # var = self.running_phi
@@ -581,18 +599,18 @@ else:
 config = {
     "weight_decay": 0.1,
     # "lr_scheduler_type": "cosine",
-    "gradient_accumulation_steps": (2**19) // (64 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
+    "gradient_accumulation_steps": (2**16 * 7) // (56 * 1024 * ddp_world_size),  # total_batch_size // (B * T * ddp_world_size
     "max_eval_steps": 20,
     "seq_length": 1024,
 
     # New centralised parameters
     "project_name": "shng2025/GPT-Valkyrie_PN-124m",
-    "total_batch_size": 2**19, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
-    "micro_batch_size": 64,
+    "total_batch_size": 2**16 * 7, # temporarily because 6 GPUs  # 2**19, ~0.5M, in number of tokens
+    "micro_batch_size": 56,
     "max_lr": 6e-4,
     "min_lr": 6e-5,  # 10% of max_lr // not used, as we are using weight_decay instead
     "warmup_steps": 715,
-    "max_steps": 19073, # had to be scaled up after 2001st step, as memory ran out when DDP
+    "max_steps": 21797, # had to be scaled up after 2001st step, as memory ran out when DDP
     "val_every": 500,           # EVALUATION
     "generate_every": 500,      # EVALUATION
     "hellaswag_every": 500,     # EVALUATION
@@ -848,7 +866,7 @@ for step in range(starting_step, max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
-    nan_count = 0  # Counter for NaN occurrences in this step
+
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -868,7 +886,6 @@ for step in range(starting_step, max_steps):
         if not torch.isnan(loss):
             loss.backward()
         else:
-            nan_count += 1
             print(f"NaN loss detected at step {step}, micro_step {micro_step}. Skipping backward.")
             if master_process:
                 wandb.alert(
@@ -876,6 +893,7 @@ for step in range(starting_step, max_steps):
                     text=f"NaN loss detected at step {step}, micro_step {micro_step}. Skipping backward.",
                     level=wandb.AlertLevel.WARN
                 )
+            break
 
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
@@ -889,16 +907,14 @@ for step in range(starting_step, max_steps):
             param_group['lr'] = lr
         optimizer.step()
     else:
+        print("successfully broke")
         print(f"NaN accumulated loss detected at step {step}. Skipping optimizer step.")
         wandb.alert(
             title="NaN Accumulated Loss Detected",
             text=f"NaN accumulated loss detected at step {step}. Skipping optimizer step.",
             level=wandb.AlertLevel.ERROR
         )
-
-    # Log NaN count
-    if master_process and nan_count > 0:
-        wandb.log({"nan_count": nan_count}, step=step)  
+        break
 
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
