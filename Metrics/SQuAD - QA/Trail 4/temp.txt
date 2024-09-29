@@ -1,20 +1,241 @@
-You're welcome! Let's focus on evaluating your summarization models using the OpenAI API with `gpt-4o` and a maximum token limit of 700. Given your data format:
+Certainly! I'd be happy to help you evaluate the text generation capabilities of your 8 ablated base models. The process will involve:
 
-- **Columns**: `model_name`, `norm_type`, `variant`, `truncated_input`, `generated_summary`
+1. **Selecting or Generating 25 Random Prompts**: We'll use a set of prompts that the models will generate text from.
 
-We'll create a script that:
+2. **Generating Text Outputs**: Each model will generate up to 1024 tokens for each prompt.
 
-1. Reads your CSV file containing summarization data.
-2. Constructs prompts for `gpt-4o` to evaluate each generated summary.
-3. Parses the responses to extract evaluation scores and explanations.
-4. Handles any potential rate limits or errors gracefully.
-5. Saves the evaluations to a new CSV file.
+3. **Saving Outputs to CSV Files**: We'll store the generated texts in CSV files, one per model.
+
+4. **Evaluating Outputs Using GPT-4o**: We'll use GPT-4o to rate the generated texts based on specific metrics.
 
 ---
 
-## **Summarization Evaluation Script**
+## **1. Selecting or Generating 25 Random Prompts**
 
-Below is the complete Python script that performs the evaluation:
+We need 25 prompts that are suitable for text generation. These prompts can be sourced from publicly available datasets or generated manually. For this example, we'll use prompts from the [OpenAI Prompt Collection](https://github.com/openai/openai-cookbook/blob/main/examples/OpenAI_prompts.md) and ensure they are appropriate.
+
+### **a. Preparing the Prompts**
+
+Here's a sample list of 25 prompts:
+
+```python
+prompts = [
+    "Once upon a time in a distant galaxy,",
+    "The secret to happiness is",
+    "In the midst of the bustling city,",
+    "As the sun set over the horizon,",
+    "The mysterious package arrived on my doorstep,",
+    "In a world where robots and humans coexist,",
+    "The ancient prophecy foretold that",
+    "Amidst the chaos of the storm,",
+    "The scientist peered into the microscope and saw",
+    "Every morning, she would start her day with",
+    "The last thing I expected to find in the attic was",
+    "Under the cover of darkness,",
+    "With a heavy heart, he decided to",
+    "On the eve of the grand festival,",
+    "The sound of laughter filled the air as",
+    "If time travel were possible,",
+    "Deep beneath the ocean waves,",
+    "In the quiet village nestled among the hills,",
+    "The door creaked open to reveal",
+    "Legends speak of a sword that",
+    "In the year 2525, humanity has",
+    "The aroma of freshly baked bread",
+    "She looked into his eyes and knew that",
+    "On the first day of school,",
+    "The journey to the top of the mountain was",
+]
+```
+
+Feel free to adjust or replace these prompts with ones that are more suitable for your models or domain.
+
+---
+
+## **2. Generating Text Outputs**
+
+We'll use the Hugging Face Transformers library to load your models and generate text. Each model will generate up to 1024 tokens for each prompt.
+
+### **a. Setting Up the Environment**
+
+First, ensure you have the necessary libraries installed:
+
+```bash
+pip install transformers pandas tqdm
+```
+
+### **b. Writing the Generation Script**
+
+Here's a script that:
+
+- Loads each model.
+- Generates text for each prompt.
+- Saves the outputs to CSV files.
+
+```python
+import os
+import pandas as pd
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from tqdm import tqdm
+
+def load_model_and_tokenizer(model_name):
+    """
+    Loads the language model and tokenizer from the specified Hugging Face repository.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    # Ensure model is in evaluation mode
+    model.eval()
+    # Move model to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    return model, tokenizer, device
+
+def generate_text(model, tokenizer, device, prompt, max_length=1024):
+    """
+    Generates text using the model and tokenizer for a given prompt.
+    """
+    inputs = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    # Ensure the total length does not exceed the model's maximum
+    max_total_length = min(tokenizer.model_max_length, max_length + inputs.shape[1])
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs,
+            max_length=max_total_length,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=1.0,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return generated_text
+
+def main():
+    # List of models to evaluate
+    models = [
+        "shng2025/GPT-Valkyrie_RMSN-124m__noNorm__",
+        "shng2025/GPT-Valkyrie_RMSN-124m__FFNonly__",
+        "shng2025/GPT-Valkyrie_RMSN-124m__AttnOnly__",
+        "shng2025/GPT-Valkyrie_LN-124m__noNorm__",
+        "shng2025/GPT-Valkyrie_LN-124m__FFNonly__",
+        "shng2025/GPT-Valkyrie_LN-124m__AttnOnly__",
+        "shng2025/GPT-Valkyrie_RMSN-124m__baseModel__",
+        "shng2025/GPT-Valkyrie_LN-124m__baseModel__"
+    ]
+
+    # Ensure output directory exists
+    output_dir = "generated_texts"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # List of prompts
+    prompts = [
+        "Once upon a time in a distant galaxy,",
+        "The secret to happiness is",
+        "In the midst of the bustling city,",
+        "As the sun set over the horizon,",
+        "The mysterious package arrived on my doorstep,",
+        "In a world where robots and humans coexist,",
+        "The ancient prophecy foretold that",
+        "Amidst the chaos of the storm,",
+        "The scientist peered into the microscope and saw",
+        "Every morning, she would start her day with",
+        "The last thing I expected to find in the attic was",
+        "Under the cover of darkness,",
+        "With a heavy heart, he decided to",
+        "On the eve of the grand festival,",
+        "The sound of laughter filled the air as",
+        "If time travel were possible,",
+        "Deep beneath the ocean waves,",
+        "In the quiet village nestled among the hills,",
+        "The door creaked open to reveal",
+        "Legends speak of a sword that",
+        "In the year 2525, humanity has",
+        "The aroma of freshly baked bread",
+        "She looked into his eyes and knew that",
+        "On the first day of school,",
+        "The journey to the top of the mountain was",
+    ]
+
+    for model_name in models:
+        print(f"Processing model: {model_name}")
+        model, tokenizer, device = load_model_and_tokenizer(model_name)
+        generated_texts = []
+
+        for prompt in tqdm(prompts, desc=f"Generating texts for {model_name}"):
+            generated_text = generate_text(model, tokenizer, device, prompt, max_length=1024)
+            generated_texts.append({
+                "model_name": model_name,
+                "prompt": prompt,
+                "generated_text": generated_text
+            })
+
+        # Save the outputs to a CSV file
+        df = pd.DataFrame(generated_texts)
+        # Extract norm_type and variant from model_name
+        norm_type, variant = extract_norm_type_variant(model_name)
+        output_filename = f"{norm_type}_{variant}_generated_texts.csv"
+        output_filepath = os.path.join(output_dir, output_filename)
+        df.to_csv(output_filepath, index=False)
+        print(f"Saved generated texts to {output_filepath}\n")
+
+def extract_norm_type_variant(model_name):
+    """
+    Extracts norm_type and variant from the model_name string.
+    """
+    try:
+        # Assuming the model_name format is: shng2025/GPT-Valkyrie_<norm_type>-124m__<variant>__
+        base_name = model_name.split('/')[-1]
+        parts = base_name.split('__')
+        config_part = parts[0]  # e.g., 'GPT-Valkyrie_RMSN-124m'
+        variant = parts[1] if len(parts) > 1 else 'Unknown'
+        norm_type = config_part.split('_')[1].split('-')[0]  # e.g., 'RMSN'
+        return norm_type, variant
+    except Exception as e:
+        print(f"Error extracting norm_type and variant from model_name '{model_name}': {e}")
+        return "Unknown", "Unknown"
+
+if __name__ == "__main__":
+    main()
+```
+
+### **Explanation of the Script**
+
+- **Imports**: The script imports necessary libraries, including `transformers` for model handling, `pandas` for data manipulation, and `torch` for model execution.
+
+- **`load_model_and_tokenizer` Function**: Loads the model and tokenizer for a given model name, moves the model to the appropriate device (GPU if available), and sets it to evaluation mode.
+
+- **`generate_text` Function**: Generates text from a given prompt using the specified model and tokenizer. It ensures the total length does not exceed the model's maximum length.
+
+- **`main` Function**: Iterates over each model and prompt, generates the text, and saves the outputs to CSV files in the `generated_texts` directory.
+
+- **`extract_norm_type_variant` Function**: Parses the `norm_type` and `variant` from the `model_name` to name the output CSV files appropriately.
+
+---
+
+## **3. Evaluating Outputs Using GPT-4o**
+
+Now that we have the generated texts, we'll use GPT-4o to evaluate each response based on specific metrics suitable for text generation.
+
+### **a. Defining Evaluation Metrics**
+
+For text generation, common evaluation criteria include:
+
+1. **Creativity**: How original and imaginative is the generated text?
+2. **Coherence**: Is the text logically consistent and does it flow well?
+3. **Fluency**: Is the text well-written with proper grammar and style?
+4. **Relevance**: Does the text stay on topic and relate to the prompt?
+5. **Engagement**: Is the text interesting and engaging to read?
+
+### **b. Writing the Evaluation Script**
+
+Here's a script that:
+
+- Reads each generated text CSV.
+- Constructs prompts for GPT-4o to evaluate the generated texts.
+- Parses the evaluations.
+- Saves the results to new CSV files.
 
 ```python
 import openai
@@ -27,19 +248,19 @@ from tqdm import tqdm
 # Set your OpenAI API key
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
-def get_gpt4_evaluation_summary(model_name, norm_type, variant, truncated_input, generated_summary):
-    # Construct the prompt for GPT-4 evaluation
-    prompt = f"""
-As an expert evaluator, your task is to assess the quality of a generated summary based on the provided truncated input text. Please focus on the following criteria:
+def get_gpt4_evaluation_text(model_name, norm_type, variant, prompt, generated_text):
+    # Construct the prompt for GPT-4o evaluation
+    evaluation_prompt = f"""
+As an expert evaluator, your task is to assess the quality of a generated text based on the provided prompt. Please focus on the following criteria:
 
-1. **Relevance**: Does the summary capture the main points of the truncated input?
-2. **Conciseness**: Is the summary succinct without unnecessary details?
-3. **Fluency**: Is the summary well-written with proper grammar and style?
-4. **Accuracy**: Does the summary accurately represent the content of the truncated input without errors?
-5. **Coherence**: Is the summary logically organized and easy to understand?
+1. **Creativity**: How original and imaginative is the text?
+2. **Coherence**: Is the text logically consistent and does it flow well?
+3. **Fluency**: Is the text well-written with proper grammar and style?
+4. **Relevance**: Does the text stay on topic and relate to the prompt?
+5. **Engagement**: Is the text interesting and engaging to read?
 
 For each criterion, provide:
-- **Score**: A number from 1 to 5 (where 1 is poor and 5 is excellent).
+- **Score**: A number from 1 to 5 (1 is poor, 5 is excellent).
 - **Explanation**: A brief justification for the score.
 
 After evaluating each criterion, provide:
@@ -50,28 +271,28 @@ After evaluating each criterion, provide:
 - **Model Name**: {model_name}
 - **Norm Type**: {norm_type}
 - **Variant**: {variant}
-- **Truncated Input**: [Truncated input is provided above.]
-- **Generated Summary**: [Generated summary is provided above.]
+- **Prompt**: [Prompt is provided above.]
+- **Generated Text**: [Generated text is provided above.]
 
 **Please present your evaluation in the following structured format:**
 
 ```
 Model Name: {model_name}
 
-Relevance Score: [1-5]
-Relevance Explanation: [Your explanation]
+Creativity Score: [1-5]
+Creativity Explanation: [Your explanation]
 
-Conciseness Score: [1-5]
-Conciseness Explanation: [Your explanation]
+Coherence Score: [1-5]
+Coherence Explanation: [Your explanation]
 
 Fluency Score: [1-5]
 Fluency Explanation: [Your explanation]
 
-Accuracy Score: [1-5]
-Accuracy Explanation: [Your explanation]
+Relevance Score: [1-5]
+Relevance Explanation: [Your explanation]
 
-Coherence Score: [1-5]
-Coherence Explanation: [Your explanation]
+Engagement Score: [1-5]
+Engagement Explanation: [Your explanation]
 
 Overall Score: [Average score]
 Overall Feedback: [Your feedback]
@@ -81,23 +302,23 @@ Comments on Columns:
 ```
 
 ---
-**Truncated Input:**
+**Prompt:**
 
-{truncated_input}
+{prompt}
 
 ---
-**Generated Summary:**
+**Generated Text:**
 
-{generated_summary}
+{generated_text}
 
 ---
 """
     # Call the OpenAI API using the ChatCompletion endpoint
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-4o",
+            model="gpt-4o",  # Ensure gpt-4o is available to you
             messages=[
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": evaluation_prompt}
             ],
             max_tokens=700,  # As per your requirement
             temperature=0.0,  # For deterministic output
@@ -110,26 +331,26 @@ Comments on Columns:
         print(f"Retrying after {retry_after} seconds...")
         time.sleep(retry_after)
         # Retry the request
-        return get_gpt4_evaluation_summary(model_name, norm_type, variant, truncated_input, generated_summary)
+        return get_gpt4_evaluation_text(model_name, norm_type, variant, prompt, generated_text)
     except Exception as e:
         print(f"Error during OpenAI API call: {e}")
         return None
 
-def parse_evaluation_summary(evaluation_text):
+def parse_evaluation_text(evaluation_text):
     """
-    Parses GPT-4's evaluation text and extracts scores, explanations, and comments.
+    Parses GPT-4o's evaluation text and extracts scores, explanations, and comments.
     """
     patterns = {
-        'Relevance Score': r'Relevance Score:\s*(\d)',
-        'Relevance Explanation': r'Relevance Explanation:\s*(.*?)\n\n',
-        'Conciseness Score': r'Conciseness Score:\s*(\d)',
-        'Conciseness Explanation': r'Conciseness Explanation:\s*(.*?)\n\n',
-        'Fluency Score': r'Fluency Score:\s*(\d)',
-        'Fluency Explanation': r'Fluency Explanation:\s*(.*?)\n\n',
-        'Accuracy Score': r'Accuracy Score:\s*(\d)',
-        'Accuracy Explanation': r'Accuracy Explanation:\s*(.*?)\n\n',
+        'Creativity Score': r'Creativity Score:\s*(\d)',
+        'Creativity Explanation': r'Creativity Explanation:\s*(.*?)\n\n',
         'Coherence Score': r'Coherence Score:\s*(\d)',
         'Coherence Explanation': r'Coherence Explanation:\s*(.*?)\n\n',
+        'Fluency Score': r'Fluency Score:\s*(\d)',
+        'Fluency Explanation': r'Fluency Explanation:\s*(.*?)\n\n',
+        'Relevance Score': r'Relevance Score:\s*(\d)',
+        'Relevance Explanation': r'Relevance Explanation:\s*(.*?)\n\n',
+        'Engagement Score': r'Engagement Score:\s*(\d)',
+        'Engagement Explanation': r'Engagement Explanation:\s*(.*?)\n\n',
         'Overall Score': r'Overall Score:\s*([\d\.]+)',
         'Overall Feedback': r'Overall Feedback:\s*(.*?)\n\n',
         'Comments on Columns': r'Comments on Columns:\s*(.*)',  # Captures the paragraph
@@ -144,78 +365,97 @@ def parse_evaluation_summary(evaluation_text):
             result[key] = None
     return result
 
-def evaluate_summaries():
-    variants = ["baseModel", "noNorm", "AttnOnly", "FFNonly"]
-    norm_types = ["LN", "RMSN"]
+def evaluate_generated_texts():
+    # Directory containing generated text CSV files
+    input_dir = "generated_texts"
+    output_dir = "evaluations"
+    os.makedirs(output_dir, exist_ok=True)
 
-    for norm_type in norm_types:
-        for variant in variants:
-            filename = f"./modified_summ-source/{norm_type}_{variant}_evaluation_data_modified.csv"
-            print(f"Processing file: {filename}")
+    # List CSV files in the input directory
+    csv_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
 
-            if not os.path.exists(filename):
-                print(f"File {filename} does not exist. Skipping.")
-                continue
+    for csv_file in csv_files:
+        input_filepath = os.path.join(input_dir, csv_file)
+        print(f"Processing file: {input_filepath}")
 
-            # Read the CSV file
-            df = pd.read_csv(filename)
-            # Limit to the first 25 rows to manage costs
-            df_limited = df.head(25)
-            evaluations = []
+        # Read the CSV file
+        df = pd.read_csv(input_filepath)
 
-            for idx, row in tqdm(df_limited.iterrows(), total=df_limited.shape[0], desc=f"Evaluating Summaries for {filename}"):
-                model_name = row['model_name']
-                norm_type = row['norm_type']
-                variant = row['variant']
-                truncated_input = row['truncated_input']
-                generated_summary = row['generated_summary']
+        # Limit to the first 25 rows to manage costs
+        df_limited = df.head(25)
+        evaluations = []
 
-                # Optionally truncate input if too long
-                max_input_length = 1000  # Adjust as needed
-                if len(truncated_input.split()) > max_input_length:
-                    truncated_input = ' '.join(truncated_input.split()[:max_input_length]) + "..."
+        for idx, row in tqdm(df_limited.iterrows(), total=df_limited.shape[0], desc=f"Evaluating texts in {csv_file}"):
+            model_name = row['model_name']
+            prompt = row['prompt']
+            generated_text = row['generated_text']
 
-                # Get GPT-4 evaluation
-                evaluation_text = get_gpt4_evaluation_summary(
-                    model_name,
-                    norm_type,
-                    variant,
-                    truncated_input,
-                    generated_summary
-                )
+            # Extract norm_type and variant from model_name
+            norm_type, variant = extract_norm_type_variant(model_name)
 
-                if evaluation_text:
-                    parsed = parse_evaluation_summary(evaluation_text)
-                    parsed['model_name'] = model_name
-                    parsed['norm_type'] = norm_type
-                    parsed['variant'] = variant
-                    evaluations.append(parsed)
-                    time.sleep(1)  # To respect API rate limits
-                else:
-                    evaluations.append({
-                        'model_name': model_name,
-                        'norm_type': norm_type,
-                        'variant': variant,
-                        'Relevance Score': None,
-                        'Relevance Explanation': None,
-                        'Conciseness Score': None,
-                        'Conciseness Explanation': None,
-                        'Fluency Score': None,
-                        'Fluency Explanation': None,
-                        'Accuracy Score': None,
-                        'Accuracy Explanation': None,
-                        'Coherence Score': None,
-                        'Coherence Explanation': None,
-                        'Overall Score': None,
-                        'Overall Feedback': None,
-                        'Comments on Columns': 'Error or Empty Response'
-                    })
+            # Optionally truncate generated_text if too long
+            max_text_length = 1000  # Adjust as needed
+            if len(generated_text.split()) > max_text_length:
+                generated_text = ' '.join(generated_text.split()[:max_text_length]) + "..."
 
-            # Save evaluations to a new CSV file
-            eval_df = pd.DataFrame(evaluations)
-            parsed_eval_filename = f"{norm_type}_{variant}_gpt4_summary_parsed_evaluations.csv"
-            eval_df.to_csv(parsed_eval_filename, index=False)
-            print(f"Saved parsed evaluations to {parsed_eval_filename}")
+            # Get GPT-4o evaluation
+            evaluation_text = get_gpt4_evaluation_text(
+                model_name,
+                norm_type,
+                variant,
+                prompt,
+                generated_text
+            )
+
+            if evaluation_text:
+                parsed = parse_evaluation_text(evaluation_text)
+                parsed['model_name'] = model_name
+                parsed['norm_type'] = norm_type
+                parsed['variant'] = variant
+                evaluations.append(parsed)
+                time.sleep(1)  # To respect API rate limits
+            else:
+                evaluations.append({
+                    'model_name': model_name,
+                    'norm_type': norm_type,
+                    'variant': variant,
+                    'Creativity Score': None,
+                    'Creativity Explanation': None,
+                    'Coherence Score': None,
+                    'Coherence Explanation': None,
+                    'Fluency Score': None,
+                    'Fluency Explanation': None,
+                    'Relevance Score': None,
+                    'Relevance Explanation': None,
+                    'Engagement Score': None,
+                    'Engagement Explanation': None,
+                    'Overall Score': None,
+                    'Overall Feedback': None,
+                    'Comments on Columns': 'Error or Empty Response'
+                })
+
+        # Save evaluations to a new CSV file
+        eval_df = pd.DataFrame(evaluations)
+        output_filename = f"{norm_type}_{variant}_evaluations.csv"
+        output_filepath = os.path.join(output_dir, output_filename)
+        eval_df.to_csv(output_filepath, index=False)
+        print(f"Saved evaluations to {output_filepath}\n")
+
+def extract_norm_type_variant(model_name):
+    """
+    Extracts norm_type and variant from the model_name string.
+    """
+    try:
+        # Assuming the model_name format is: shng2025/GPT-Valkyrie_<norm_type>-124m__<variant>__
+        base_name = model_name.split('/')[-1]
+        parts = base_name.split('__')
+        config_part = parts[0]  # e.g., 'GPT-Valkyrie_RMSN-124m'
+        variant = parts[1] if len(parts) > 1 else 'Unknown'
+        norm_type = config_part.split('_')[1].split('-')[0]  # e.g., 'RMSN'
+        return norm_type, variant
+    except Exception as e:
+        print(f"Error extracting norm_type and variant from model_name '{model_name}': {e}")
+        return "Unknown", "Unknown"
 
 if __name__ == "__main__":
-    evaluate_summaries()
+    evaluate_generated_texts()
