@@ -1,0 +1,9 @@
+rouge1_full,rouge2_full,rougeL_full,bleu_full,rouge1_truncated,rouge2_truncated,rougeL_truncated,bleu_truncated,gen_len,model_name,norm_type,variant
+0.2735,0.0593,0.1613,0.5215,0.3354,0.0607,0.1926,2.1973,119.02,shng2025/GPT-Valkyrie_LN-124m__baseModel__Billsum,LN,baseModel
+0.2669,0.0565,0.155,0.6288,0.3213,0.0597,0.1845,2.372,118.7,shng2025/GPT-Valkyrie_LN-124m__noNorm__Billsum,LN,noNorm
+0.2738,0.0595,0.1605,0.669,0.3306,0.0602,0.1894,2.5516,120.38,shng2025/GPT-Valkyrie_LN-124m__AttnOnly__Billsum,LN,AttnOnly
+0.2652,0.0541,0.1559,0.5657,0.3208,0.0576,0.1849,2.073,119.12,shng2025/GPT-Valkyrie_LN-124m__FFNonly__Billsum,LN,FFNonly
+0.2697,0.0624,0.155,0.7039,0.3272,0.0617,0.1814,2.3624,117.95,shng2025/GPT-Valkyrie_RMSN-124m__baseModel__Billsum,RMSN,baseModel
+0.2708,0.062,0.1539,0.6267,0.3302,0.0597,0.1831,2.1903,118.57,shng2025/GPT-Valkyrie_RMSN-124m__noNorm__Billsum,RMSN,noNorm
+0.2788,0.0667,0.1598,0.7991,0.3407,0.0681,0.1909,2.697,119.4,shng2025/GPT-Valkyrie_RMSN-124m__AttnOnly__Billsum,RMSN,AttnOnly
+0.2756,0.0641,0.157,0.7096,0.3312,0.0637,0.1855,2.4964,118.95,shng2025/GPT-Valkyrie_RMSN-124m__FFNonly__Billsum,RMSN,FFNonly

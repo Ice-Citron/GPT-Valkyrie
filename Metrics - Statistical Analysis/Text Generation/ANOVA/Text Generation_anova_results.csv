@@ -1,0 +1,7 @@
+Task,Metric,F-value,p-value
+Text Generation,Overall Score,92.04973702611498,6.631596163008176e-58
+Text Generation,Creativity Score,121.93266606005456,3.772097567760115e-67
+Text Generation,Coherence Score,29.922077922077932,1.0125867044428068e-27
+Text Generation,Fluency Score,134.24390243902457,1.9614047557025055e-70
+Text Generation,Relevance Score,37.18279569892469,1.3800459858566396e-32
+Text Generation,Engagement Score,40.156035846072776,1.987119869704935e-34
